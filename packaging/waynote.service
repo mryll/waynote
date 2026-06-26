@@ -1,0 +1,12 @@
+[Unit]
+Description=Waynote — Wayland sticky notes
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/waynote
+Restart=on-failure
+
+[Install]
+WantedBy=graphical-session.target

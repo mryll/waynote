@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Waynote
+Comment=Wayland-native markdown sticky notes
+Exec=waynote
+Icon=waynote
+Categories=Utility;TextEditor;
+Keywords=notes;sticky;markdown;wayland;
+StartupNotify=false
+Terminal=false

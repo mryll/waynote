@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <!-- Sticky note body: warm yellow with rounded corners -->
+  <rect x="32" y="32" width="176" height="176" rx="14" fill="#F6EBA8" stroke="#E3D58C" stroke-width="6"/>
+  <!-- Folded corner: bottom-right triangle -->
+  <path d="M168 208 L208 168 L168 168 Z" fill="#E3D58C"/>
+  <!-- Text lines suggesting note content -->
+  <rect x="60" y="74" width="120" height="12" rx="6" fill="#6E6447"/>
+  <rect x="60" y="104" width="120" height="10" rx="5" fill="#8A7F5E"/>
+  <rect x="60" y="130" width="92" height="10" rx="5" fill="#8A7F5E"/>
+</svg>

@@ -1,0 +1,32 @@
+[package]
+name = "waynote"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Wayland-native markdown sticky notes for tiling WMs (wlr-layer-shell)"
+repository = "https://github.com/mryll/waynote"
+homepage = "https://github.com/mryll/waynote"
+readme = "README.md"
+keywords = ["wayland", "sticky-notes", "markdown", "layer-shell", "gtk4"]
+categories = ["gui", "command-line-utilities"]
+
+[dependencies]
+gtk = { version = "0.11.3", package = "gtk4", features = ["v4_10"] }
+gtk4-layer-shell = "0.8.0"
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+ksni = { version = "0.3.5", features = ["blocking"] }
+notify = "6"
+pulldown-cmark = { version = "0.13.4", features = ["default"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_yaml_ng = "0.10.0"
+sha2 = "0.11.0"
+toml = "1.1.2"
+ulid = "1.2.1"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
