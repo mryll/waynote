@@ -55,32 +55,48 @@ Waynote needs a compositor that implements `wlr-layer-shell`:
 - ✅ **Supported:** Hyprland, Sway, river, Wayfire, niri, KDE/KWin, COSMIC.
 - ❌ **Not supported:** GNOME/Mutter (no layer-shell), X11, macOS, Windows.
 
-## Requirements
+## Install
 
-- A `wlr-layer-shell` Wayland compositor (see above)
-- [Rust](https://www.rust-lang.org/tools/install) (stable) and Cargo
-- GTK 4 and `gtk4-layer-shell` development libraries
+### Arch Linux (AUR)
 
-On Arch-based systems:
+The quickest path on Arch and derivatives — two packages are available, pick one:
+
+```sh
+yay -S waynote-bin   # prebuilt binary, no compilation
+yay -S waynote       # builds from source
+```
+
+Either one installs the `waynote` binary, a desktop entry, the tray icon, and a
+(disabled) `systemd` user unit, and pulls in the `gtk4` and `gtk4-layer-shell`
+runtime dependencies automatically. Nothing else to do — skip to
+[Running the app](#running-the-app).
+
+### From source
+
+You'll need a `wlr-layer-shell` compositor (see
+[Compatibility](#compatibility)), [Rust](https://www.rust-lang.org/tools/install)
+(stable), and the GTK 4 + `gtk4-layer-shell` development libraries. On Arch:
 
 ```sh
 sudo pacman -S gtk4 gtk4-layer-shell rust
 ```
 
-## Getting started
-
-Clone and build from source:
+Then build, and install the desktop entry, tray icon, and systemd unit into your
+home directory:
 
 ```sh
 git clone https://github.com/mryll/waynote.git
 cd waynote
 cargo build --release
+./target/release/waynote install-user-assets   # desktop entry, tray icon, systemd unit
 ```
+
+## Usage
 
 ### Running the app
 
 ```sh
-waynote          # or: cargo run
+waynote          # or, from a source checkout: cargo run
 ```
 
 Loads notes from `$XDG_DATA_HOME/waynote/notes/` (typically
