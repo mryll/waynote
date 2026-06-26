@@ -538,10 +538,10 @@ fn install_event_handlers(this: &Rc<RefCell<Controller>>) {
         // Wire drag + resize gestures. The closures capture Weak<RefCell<Controller>>
         // and borrow_mut() only when a gesture event fires — safe on the GTK main thread.
         // Bounds are this note's own monitor's logical rect.
-        let bounds = surface_bounds(&ctrl, presenter::surface_index_for(&ctrl, &id));
-        entry.chrome.wire_drag_gesture(id.clone(), weak.clone(), bounds);
-        entry.chrome.wire_resize_gesture(id.clone(), weak.clone(), bounds);
-        wire_header_buttons(&entry.chrome, &weak, &id, &ctrl.monitors);
+        entry.chrome.wire_drag_gesture(id.clone(), weak.clone());
+        entry.chrome.wire_resize_gesture(id.clone(), weak.clone());
+        let current_monitor = presenter::monitor_for(&ctrl, &id);
+        wire_header_buttons(&entry.chrome, &weak, &id, &ctrl.monitors, current_monitor);
     }
 }
 
@@ -586,6 +586,20 @@ fn wire_lock_button(
     });
 }
 
+/// PURE: build the "move to monitor" destinations for a note — `(global index,
+/// label)` for every monitor *except* the one it currently lives on. Empty when
+/// there is nowhere else to move (e.g. a single-monitor setup), which the header
+/// uses to hide the monitor button. The global index is preserved so a popover row
+/// maps back to the index `Controller::move_to_monitor` expects.
+fn monitor_destinations(monitors: &[MonitorInfo], current: usize) -> Vec<(usize, String)> {
+    monitors
+        .iter()
+        .enumerate()
+        .filter(|(idx, _)| *idx != current)
+        .map(|(idx, m)| (idx, monitor_label(m)))
+        .collect()
+}
+
 /// A monitor's menu label: "DP-1: Dell U2720Q" (connector + description), falling
 /// back gracefully when either is missing.
 fn monitor_label(m: &MonitorInfo) -> String {
@@ -604,23 +618,104 @@ fn wire_header_buttons(
     weak: &std::rc::Weak<RefCell<Controller>>,
     id: &NoteId,
     monitors: &[MonitorInfo],
+    current_monitor: usize,
 ) {
     wire_layer_button(&chrome.layer_button, weak.clone(), id.clone());
     wire_lock_button(&chrome.lock_button, weak.clone(), id.clone());
+    wire_delete_button(&chrome.delete_button, weak.clone(), id.clone());
+    populate_monitor_menu(chrome, weak, id, monitors, current_monitor);
+}
 
-    // Monitor menu: one row per monitor; choosing one moves the note there.
-    let items: Vec<String> = monitors.iter().map(monitor_label).collect();
+/// Build (or rebuild) a note's "move to monitor" menu so it lists every monitor
+/// EXCEPT the one the note currently lives on. Called when the header is first
+/// wired AND again after the note moves monitors (see `move_to_monitor`), so the
+/// menu never goes stale — offering its own monitor or omitting the one it left.
+/// `target_global[local]` maps a popover row back to the monitor index
+/// `move_to_monitor` expects (a position in `ctrl.monitors`), since the filtered
+/// local index no longer matches it.
+fn populate_monitor_menu(
+    chrome: &render::NoteChrome,
+    weak: &std::rc::Weak<RefCell<Controller>>,
+    id: &NoteId,
+    monitors: &[MonitorInfo],
+    current_monitor: usize,
+) {
+    let destinations = monitor_destinations(monitors, current_monitor);
+    let labels: Vec<String> = destinations.iter().map(|(_, l)| l.clone()).collect();
+    let target_global: Vec<usize> = destinations.iter().map(|(i, _)| *i).collect();
     let weak = weak.clone();
     let id = id.clone();
-    let on_select: Rc<dyn Fn(usize)> = Rc::new(move |idx| {
+    let on_select: Rc<dyn Fn(usize)> = Rc::new(move |local| {
+        let Some(&target) = target_global.get(local) else {
+            return;
+        };
         let (weak, id) = (weak.clone(), id.clone());
         glib::idle_add_local_once(move || {
             if let Some(ctrl) = weak.upgrade() {
-                Controller::move_to_monitor(&ctrl, &id, idx);
+                Controller::move_to_monitor(&ctrl, &id, target);
             }
         });
     });
-    chrome.set_monitor_menu(&items, on_select);
+    chrome.set_monitor_menu(&labels, on_select);
+}
+
+/// Wire the per-note delete button: clicking it opens a confirmation popover; the
+/// "Delete" row moves the note to the app trash. The actual deletion is deferred to
+/// an idle tick (like the other header buttons) because `delete_to_trash` destroys
+/// this note's widget subtree — which contains the very popover button being
+/// clicked — so it must not run while that click handler is still on the stack.
+fn wire_delete_button(
+    button: &gtk::MenuButton,
+    weak: std::rc::Weak<RefCell<Controller>>,
+    id: NoteId,
+) {
+    use gtk::prelude::*;
+    let popover = gtk::Popover::new();
+    let body = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    body.add_css_class("waynote-confirm");
+
+    let prompt = gtk::Label::new(Some("Delete this note?"));
+    prompt.set_halign(gtk::Align::Start);
+    let hint = gtk::Label::new(Some("It will be moved to the trash."));
+    hint.add_css_class("dim-label");
+    hint.set_halign(gtk::Align::Start);
+
+    let actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    actions.set_halign(gtk::Align::End);
+    let cancel = gtk::Button::with_label("Cancel");
+    cancel.add_css_class("flat");
+    let confirm = gtk::Button::with_label("Delete");
+    confirm.add_css_class("destructive-action");
+    actions.append(&cancel);
+    actions.append(&confirm);
+
+    body.append(&prompt);
+    body.append(&hint);
+    body.append(&actions);
+    popover.set_child(Some(&body));
+    button.set_popover(Some(&popover));
+
+    let pop = popover.downgrade();
+    cancel.connect_clicked(move |_| {
+        if let Some(p) = pop.upgrade() {
+            p.popdown();
+        }
+    });
+
+    let pop = popover.downgrade();
+    confirm.connect_clicked(move |_| {
+        if let Some(p) = pop.upgrade() {
+            p.popdown();
+        }
+        let (weak, id) = (weak.clone(), id.clone());
+        glib::idle_add_local_once(move || {
+            if let Some(ctrl) = weak.upgrade() {
+                if let Err(e) = Controller::delete_to_trash(&ctrl, &id) {
+                    eprintln!("[waynote] delete: trash failed for {id}: {e}");
+                }
+            }
+        });
+    });
 }
 
 /// Install the event handler for a single note entry (used by `insert_note`
@@ -630,7 +725,6 @@ fn install_event_handler_for(this: &Rc<RefCell<Controller>>, id: &NoteId) {
     let ctrl = this.borrow();
     let Some(entry) = ctrl.entries.get(id) else { return };
     let weak = Rc::downgrade(this);
-    let bounds = surface_bounds(&ctrl, presenter::surface_index_for(&ctrl, id));
     let id = id.clone();
     let weak_handler = weak.clone();
     let id_handler = id.clone();
@@ -647,9 +741,10 @@ fn install_event_handler_for(this: &Rc<RefCell<Controller>>, id: &NoteId) {
     });
     render::NoteView::set_event_handler(&entry.chrome.note_view, handler);
     // Wire drag + resize gestures for this entry.
-    entry.chrome.wire_drag_gesture(id.clone(), weak.clone(), bounds);
-    entry.chrome.wire_resize_gesture(id.clone(), weak.clone(), bounds);
-    wire_header_buttons(&entry.chrome, &weak, &id, &ctrl.monitors);
+    entry.chrome.wire_drag_gesture(id.clone(), weak.clone());
+    entry.chrome.wire_resize_gesture(id.clone(), weak.clone());
+    let current_monitor = presenter::monitor_for(&ctrl, &id);
+    wire_header_buttons(&entry.chrome, &weak, &id, &ctrl.monitors, current_monitor);
 }
 
 /// Backup ESC handler at the surface-window level: commits the active editor even
@@ -935,6 +1030,10 @@ impl render::DragResizeHandler for Controller {
             .unwrap_or((200, 150))
     }
 
+    fn current_bounds(&self, id: &NoteId) -> crate::platform::geometry::Rect {
+        surface_bounds(self, presenter::surface_index_for(self, id))
+    }
+
     fn move_live(&mut self, id: &NoteId, x: i32, y: i32) {
         use gtk::prelude::FixedExt;
         // Transient: move ONLY the visual widget. Do NOT mutate durable geometry
@@ -1202,6 +1301,16 @@ impl Controller {
             }
         }
         presenter::sync_all(&mut this.borrow_mut());
+
+        // The note now lives on a different monitor, so rebuild its "move to monitor"
+        // menu: it must drop the new current monitor and re-offer the one it just
+        // left. Refresh only the menu (the other header handlers are unchanged).
+        let weak = Rc::downgrade(this);
+        let c = this.borrow();
+        if let Some(entry) = c.entries.get(id) {
+            let current = presenter::monitor_for(&c, id);
+            populate_monitor_menu(&entry.chrome, &weak, id, &c.monitors, current);
+        }
     }
 
     /// Move note `id` to `target`, given as a monitor index ("1") OR a connector
@@ -1342,6 +1451,13 @@ impl Controller {
         let surf_idx = presenter::surface_index_for(&this.borrow(), id);
         {
             let mut c = this.borrow_mut();
+            // If the note being deleted is the active editor, end the edit session
+            // (drop its keyboard grab) before removing it — its edit buffer is
+            // discarded along with the note.
+            if c.active_editor.as_deref() == Some(id) {
+                c.active_editor = None;
+                apply_keyboard_modes(&c.manager, None);
+            }
             c.entries.remove(id);
             c.layout.remove(id);
             if let Err(e) = layout::save(&c.paths.clone(), &c.layout) {
@@ -2137,6 +2253,37 @@ mod tests {
         assert_eq!(r.x, 1640);
         assert_eq!(r.y, 100);
         assert_eq!((r.w, r.h), (280, 220), "size unchanged");
+    }
+
+    fn mon_info(index: usize, out: &str) -> MonitorInfo {
+        MonitorInfo {
+            output_id: out.into(),
+            description: String::new(),
+            logical: [0, 0, 1920, 1080],
+            index,
+        }
+    }
+
+    #[test]
+    fn monitor_destinations_excludes_current_and_keeps_global_indices() {
+        let monitors = [mon_info(0, "DP-1"), mon_info(1, "DP-2"), mon_info(2, "DP-3")];
+        let dests = monitor_destinations(&monitors, 1);
+        // The note's own monitor (index 1 / DP-2) is dropped; the others remain
+        // with their ORIGINAL indices so move_to_monitor targets the right one.
+        assert_eq!(dests.len(), 2);
+        assert_eq!(dests[0].0, 0);
+        assert_eq!(dests[1].0, 2);
+        assert!(
+            dests.iter().all(|(_, label)| !label.contains("DP-2")),
+            "current monitor must not appear as a destination"
+        );
+    }
+
+    #[test]
+    fn monitor_destinations_single_monitor_is_empty() {
+        // One monitor → nowhere to move → empty → the header hides the button.
+        let monitors = [mon_info(0, "DP-1")];
+        assert!(monitor_destinations(&monitors, 0).is_empty());
     }
 
     /// Tempdir: `move_to_trash` removes the file from notes/ and lands it in

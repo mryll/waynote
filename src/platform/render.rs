@@ -97,6 +97,8 @@ const CARD_CSS: &str = "
 .waynote-swatch.purple { background: #E0D4F0; border: 1px solid #CBBCE6; }
 .waynote-swatch.gray   { background: #DEDCD6; border: 1px solid #C9C7C0; }
 .waynote-swatch.orange { background: #F6D9B8; border: 1px solid #E8C49A; }
+/* Delete confirmation popover: a little breathing room around the prompt. */
+.waynote-confirm { padding: 4px; }
 /* Markdown task checkboxes (GTK4 tree: checkbutton > check). Replace Adwaita's
    heavy dark indicator with a light outline box in the paper's ink — muted when
    empty, the paper accent when checked — so done/undone read clearly on pastel. */
@@ -1598,6 +1600,12 @@ pub trait DragResizeHandler {
     fn entry_position(&self, id: &crate::app::note_entry::NoteId) -> (i32, i32);
     /// Read the note's current (w, h) size.
     fn entry_size(&self, id: &crate::app::note_entry::NoteId) -> (i32, i32);
+    /// The clamp bounds for drag/resize: the logical rect of the monitor the note
+    /// lives on RIGHT NOW. Read fresh at gesture-begin (not captured at wire time),
+    /// so a note moved to a different-sized monitor drags across the whole new
+    /// screen instead of being clamped to its old monitor's dimensions.
+    fn current_bounds(&self, id: &crate::app::note_entry::NoteId)
+        -> crate::platform::geometry::Rect;
     /// Update position live during drag (no disk write).
     fn move_live(&mut self, id: &crate::app::note_entry::NoteId, x: i32, y: i32);
     /// Update size live during resize (no disk write).
@@ -1748,6 +1756,9 @@ pub struct NoteChrome {
     /// available monitors. Hidden unless there is more than one; the Controller
     /// populates the menu via `set_monitor_menu`.
     pub monitor_button: gtk::MenuButton,
+    /// Per-note "delete" button: a `MenuButton` whose popover (built by the
+    /// Controller) asks for confirmation before the note is moved to trash.
+    pub delete_button: gtk::MenuButton,
     /// Bottom-right resize handle (Task 9 attaches a `GestureDrag` here). A styled
     /// glyph `Label` rather than a `gtk::Image`: an icon-theme-independent glyph is
     /// always visible, whereas a diagonal-resize symbolic icon is not portable.
@@ -1822,13 +1833,25 @@ impl NoteChrome {
         monitor_button.set_tooltip_text(Some("Move to monitor…"));
         monitor_button.set_visible(false);
 
-        // Controls cluster: conflict pill + colour + lock + layer + monitor.
+        // "Delete note" button: a MenuButton whose popover the Controller fills with
+        // a confirmation prompt (deletion moves the note to the app trash).
+        let delete_button = gtk::MenuButton::new();
+        finish_header_menu_button(&delete_button);
+        if use_symbolic_icons() {
+            delete_button.set_icon_name("user-trash-symbolic");
+        } else {
+            delete_button.set_label("🗑");
+        }
+        delete_button.set_tooltip_text(Some("Delete note"));
+
+        // Controls cluster: conflict pill + colour + lock + layer + monitor + delete.
         let controls = gtk::Box::new(Orientation::Horizontal, 0);
         controls.append(&conflict_label);
         controls.append(&color_button);
         controls.append(&lock_button);
         controls.append(&layer_button);
         controls.append(&monitor_button);
+        controls.append(&delete_button);
         controls.set_can_focus(false);
 
         let header = gtk::Box::new(Orientation::Horizontal, 0);
@@ -1868,6 +1891,7 @@ impl NoteChrome {
             layer_button,
             lock_button,
             monitor_button,
+            delete_button,
             grip,
             title: title_label,
             conflict_label,
@@ -1913,11 +1937,12 @@ impl NoteChrome {
         self.lock_button.set_tooltip_text(Some(tip));
     }
 
-    /// Populate the "move to monitor" menu with one row per monitor (`items`, e.g.
-    /// "DP-1: Dell U2720Q"); choosing a row calls `on_select(index)`. The button is
-    /// shown only when there is more than one monitor (nothing to move to otherwise).
+    /// Populate the "move to monitor" menu with one row per *destination* monitor
+    /// (`items`, e.g. "DP-1: Dell U2720Q" — the note's current monitor is excluded
+    /// by the Controller); choosing a row calls `on_select(index)`. The button is
+    /// shown only when there is at least one other monitor to move to.
     pub fn set_monitor_menu(&self, items: &[String], on_select: Rc<dyn Fn(usize)>) {
-        if items.len() <= 1 {
+        if items.is_empty() {
             self.monitor_button.set_visible(false);
             return;
         }
@@ -1993,12 +2018,11 @@ impl NoteChrome {
         &self,
         id: crate::app::note_entry::NoteId,
         ctrl_weak: std::rc::Weak<std::cell::RefCell<C>>,
-        surface_bounds: crate::platform::geometry::Rect,
     ) where
         C: DragResizeHandler + 'static,
     {
         use gtk::GestureDrag;
-        use crate::platform::geometry::drag_to;
+        use crate::platform::geometry::{drag_to, Rect};
 
         let gesture = GestureDrag::new();
         // Use Button 1 (primary) only for dragging.
@@ -2012,9 +2036,15 @@ impl NoteChrome {
             std::rc::Rc::new(std::cell::Cell::new((0, 0, 0, 0)));
         let start_ptr: std::rc::Rc<std::cell::Cell<(f64, f64)>> =
             std::rc::Rc::new(std::cell::Cell::new((0.0, 0.0)));
+        // The clamp bounds for THIS gesture, read fresh on drag-begin (the gesture is
+        // wired once and never rebuilt, so capturing a fixed rect would clamp to the
+        // note's monitor-at-wire-time after it is moved to a different-sized one).
+        let bounds: std::rc::Rc<std::cell::Cell<Rect>> =
+            std::rc::Rc::new(std::cell::Cell::new(Rect { x: 0, y: 0, w: 0, h: 0 }));
 
         let geom_begin = start_geom.clone();
         let ptr_begin = start_ptr.clone();
+        let bounds_begin = bounds.clone();
         let weak_begin = ctrl_weak.clone();
         let id_begin = id.clone();
         gesture.connect_drag_begin(move |g, _x, _y| {
@@ -2022,27 +2052,28 @@ impl NoteChrome {
             let Some(ctrl) = weak_begin.upgrade() else { return };
             // Lift the note's surface for the gesture if it's on the Desktop layer.
             ctrl.borrow_mut().begin_pointer_drag(&id_begin);
-            let (px, py, gw, gh) = {
+            let (px, py, gw, gh, b) = {
                 let c = ctrl.borrow();
                 let (px, py) = c.entry_position(&id_begin);
                 let (gw, gh) = c.entry_size(&id_begin);
-                (px, py, gw, gh)
+                (px, py, gw, gh, c.current_bounds(&id_begin))
             };
             geom_begin.set((px, py, gw, gh));
             ptr_begin.set(ptr);
+            bounds_begin.set(b);
         });
 
         let geom_update = start_geom.clone();
         let ptr_update = start_ptr.clone();
+        let bounds_update = bounds.clone();
         let weak_update = ctrl_weak.clone();
         let id_update = id.clone();
-        let bounds_update = surface_bounds;
         gesture.connect_drag_update(move |g, _off_x, _off_y| {
             let Some((dx, dy)) = pointer_delta(g, &ptr_update) else { return };
             let Some(ctrl) = weak_update.upgrade() else { return };
             let (sx, sy, sw, sh) = geom_update.get();
-            let origin = crate::platform::geometry::Rect { x: sx, y: sy, w: sw, h: sh };
-            let new = drag_to(origin, dx, dy, bounds_update);
+            let origin = Rect { x: sx, y: sy, w: sw, h: sh };
+            let new = drag_to(origin, dx, dy, bounds_update.get());
             ctrl.borrow_mut().move_live(&id_update, new.x, new.y);
         });
 
@@ -2054,8 +2085,8 @@ impl NoteChrome {
             // lifted surface on release (incl. a cancelled gesture).
             if let Some((dx, dy)) = pointer_delta(g, &start_ptr) {
                 let (sx, sy, sw, sh) = start_geom.get();
-                let origin = crate::platform::geometry::Rect { x: sx, y: sy, w: sw, h: sh };
-                let new = drag_to(origin, dx, dy, surface_bounds);
+                let origin = Rect { x: sx, y: sy, w: sw, h: sh };
+                let new = drag_to(origin, dx, dy, bounds.get());
                 ctrl.borrow_mut().commit_move(&id_end, new.x, new.y);
             }
             ctrl.borrow_mut().end_pointer_drag(&id_end);
@@ -2076,12 +2107,11 @@ impl NoteChrome {
         &self,
         id: crate::app::note_entry::NoteId,
         ctrl_weak: std::rc::Weak<std::cell::RefCell<C>>,
-        surface_bounds: crate::platform::geometry::Rect,
     ) where
         C: DragResizeHandler + 'static,
     {
         use gtk::GestureDrag;
-        use crate::platform::geometry::resize_to;
+        use crate::platform::geometry::{resize_to, Rect};
         const MIN_W: i32 = 160;
         const MIN_H: i32 = 150;
 
@@ -2094,9 +2124,14 @@ impl NoteChrome {
             std::rc::Rc::new(std::cell::Cell::new((0, 0, 0, 0)));
         let start_ptr: std::rc::Rc<std::cell::Cell<(f64, f64)>> =
             std::rc::Rc::new(std::cell::Cell::new((0.0, 0.0)));
+        // Fresh-on-begin clamp bounds — see `wire_drag_gesture` for why this is not
+        // captured once at wire time.
+        let bounds: std::rc::Rc<std::cell::Cell<Rect>> =
+            std::rc::Rc::new(std::cell::Cell::new(Rect { x: 0, y: 0, w: 0, h: 0 }));
 
         let rect_begin = start_rect.clone();
         let ptr_begin = start_ptr.clone();
+        let bounds_begin = bounds.clone();
         let weak_begin = ctrl_weak.clone();
         let id_begin = id.clone();
         gesture.connect_drag_begin(move |g, _x, _y| {
@@ -2104,27 +2139,28 @@ impl NoteChrome {
             let Some(ctrl) = weak_begin.upgrade() else { return };
             // Lift the note's surface for the gesture if it's on the Desktop layer.
             ctrl.borrow_mut().begin_pointer_drag(&id_begin);
-            let (px, py, w, h) = {
+            let (px, py, w, h, b) = {
                 let c = ctrl.borrow();
                 let (px, py) = c.entry_position(&id_begin);
                 let (w, h) = c.entry_size(&id_begin);
-                (px, py, w, h)
+                (px, py, w, h, c.current_bounds(&id_begin))
             };
             rect_begin.set((px, py, w, h));
             ptr_begin.set(ptr);
+            bounds_begin.set(b);
         });
 
         let rect_update = start_rect.clone();
         let ptr_update = start_ptr.clone();
+        let bounds_update = bounds.clone();
         let weak_update = ctrl_weak.clone();
         let id_update = id.clone();
-        let bounds_update = surface_bounds;
         gesture.connect_drag_update(move |g, _off_x, _off_y| {
             let Some((dx, dy)) = pointer_delta(g, &ptr_update) else { return };
             let Some(ctrl) = weak_update.upgrade() else { return };
             let (px, py, w, h) = rect_update.get();
-            let start = crate::platform::geometry::Rect { x: px, y: py, w, h };
-            let new = resize_to(start, dx, dy, MIN_W, MIN_H, bounds_update);
+            let start = Rect { x: px, y: py, w, h };
+            let new = resize_to(start, dx, dy, MIN_W, MIN_H, bounds_update.get());
             ctrl.borrow_mut().resize_live(&id_update, new.w, new.h);
         });
 
@@ -2136,8 +2172,8 @@ impl NoteChrome {
             // lifted surface on release (incl. a cancelled gesture).
             if let Some((dx, dy)) = pointer_delta(g, &start_ptr) {
                 let (px, py, w, h) = start_rect.get();
-                let start = crate::platform::geometry::Rect { x: px, y: py, w, h };
-                let new = resize_to(start, dx, dy, MIN_W, MIN_H, surface_bounds);
+                let start = Rect { x: px, y: py, w, h };
+                let new = resize_to(start, dx, dy, MIN_W, MIN_H, bounds.get());
                 ctrl.borrow_mut().commit_resize(&id_end, new.w, new.h);
             }
             ctrl.borrow_mut().end_pointer_drag(&id_end);
