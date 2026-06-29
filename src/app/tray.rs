@@ -78,7 +78,7 @@ impl ksni::Tray for WaynoteTray {
     }
 
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
-        use ksni::menu::{CheckmarkItem, MenuItem, StandardItem, SubMenu};
+        use ksni::menu::{MenuItem, StandardItem, SubMenu};
         let send = |cmd: TrayCommand| {
             move |t: &mut WaynoteTray| {
                 let _ = t.tx.send(cmd);
@@ -136,14 +136,18 @@ impl ksni::Tray for WaynoteTray {
         items.push(sep());
         items.push(item("Arrange", "view-grid-symbolic", TrayCommand::Arrange));
 
-        // "Ask before deleting" toggle. The checkmark reflects the live shared flag;
-        // activation computes the next value, stores it immediately (so the menu is
-        // consistent), then sends it for the GTK thread to persist.
+        // "Ask before deleting" toggle. A `CheckmarkItem`'s native checkmark isn't
+        // drawn by some hosts (Waybar), so the state lives in the LABEL as a ☑/☐ glyph
+        // (renders everywhere). Activation flips the shared flag immediately (so the
+        // menu is consistent) and sends it for the GTK thread to persist.
         items.push(sep());
+        let confirm_on = self.confirm_delete.load(std::sync::atomic::Ordering::Relaxed);
         items.push(
-            CheckmarkItem {
-                label: "Ask before deleting".into(),
-                checked: self.confirm_delete.load(std::sync::atomic::Ordering::Relaxed),
+            StandardItem {
+                label: format!(
+                    "{}  Ask before deleting",
+                    if confirm_on { "☑" } else { "☐" }
+                ),
                 activate: Box::new(|t: &mut WaynoteTray| {
                     let next = !t.confirm_delete.load(std::sync::atomic::Ordering::Relaxed);
                     t.confirm_delete.store(next, std::sync::atomic::Ordering::Relaxed);

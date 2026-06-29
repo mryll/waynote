@@ -70,9 +70,6 @@ pub struct Controller {
     pub watch_guard: Option<WatchGuard>,
     /// Keeps the tray alive; dropping it stops the SNI service.
     pub tray_handle: Option<super::tray::TrayHandle>,
-    /// A weak handle to self, for `&mut self` methods that need to schedule deferred
-    /// (timeout/idle) work — e.g. the edit-focus keyboard grab. Set in `new`.
-    self_weak: std::rc::Weak<RefCell<Controller>>,
 }
 
 impl Controller {
@@ -85,7 +82,7 @@ impl Controller {
             crate::platform::runtime_prefs::load_confirm_delete(&paths, config.confirm_delete),
         ));
         let surf_count = manager.surfaces().len();
-        let rc = Rc::new(RefCell::new(Self {
+        Rc::new(RefCell::new(Self {
             manager,
             entries: HashMap::new(),
             views: (0..surf_count).map(|_| HashMap::new()).collect(),
@@ -103,10 +100,7 @@ impl Controller {
             drag_input_surface: None,
             watch_guard: None,
             tray_handle: None,
-            self_weak: std::rc::Weak::new(),
-        }));
-        rc.borrow_mut().self_weak = Rc::downgrade(&rc);
-        rc
+        }))
     }
 
     /// Load all notes from disk into entries (card widgets built here; placed by
@@ -421,26 +415,12 @@ impl Controller {
             set_effective_layer(self, id, crate::core::note::Layer::Front);
         }
 
-        // 4. Hybrid keyboard focus. Wayland won't let an app force keyboard focus onto
-        //    a layer surface, so a new note isn't typeable without a click. Workaround:
-        //    grab the keyboard briefly with Exclusive (pulls focus onto the note), then
-        //    drop to OnDemand a moment later so the rest of the edit allows click-away +
-        //    the note's header actions. Per Hyprland #8293, changing interactivity keeps
-        //    the focus, so the note stays focused after the drop. (Experimental — if a
-        //    compositor doesn't retain focus, it degrades to plain OnDemand.)
+        // 4. OnDemand keyboard on the FINAL editing surface (post-front), None elsewhere.
+        //    (Wayland won't force focus onto a layer surface — a new note isn't auto-
+        //    focused; click it once to type. Exclusive would auto-focus but captures the
+        //    keyboard for the whole session, breaking click-away + header actions.)
         let surf_idx = presenter::surface_index_for(self, id);
-        apply_keyboard_grab_exclusive(&self.manager, surf_idx);
-        let weak = self.self_weak.clone();
-        let id_drop = id.clone();
-        glib::timeout_add_local_once(std::time::Duration::from_millis(120), move || {
-            let Some(ctrl) = weak.upgrade() else { return };
-            let c = ctrl.borrow();
-            // Only drop to OnDemand if still editing THIS note.
-            if c.active_editor.as_deref() == Some(&id_drop) {
-                let si = presenter::surface_index_for(&c, &id_drop);
-                apply_keyboard_modes(&c.manager, Some(si));
-            }
-        });
+        apply_keyboard_modes(&self.manager, Some(surf_idx));
 
         // 5. Now switch to the edit page + grab focus.
         if let Some(nv) = self.entries.get(id).map(|e| e.chrome.note_view.clone()) {
@@ -1328,22 +1308,6 @@ impl render::DragResizeHandler for Controller {
 /// committed on explicit exit (ESC / save pill / clicking another note). Desktop
 /// notes are fronted to a Top surface first, where focus is reliable. See
 /// `edit_session` for the auto-focus limitation this implies.
-/// One-off: set ONLY `surf_idx` to `Exclusive` (others `None`) to momentarily pull
-/// keyboard focus onto the editing surface (Wayland won't focus a layer surface on
-/// demand). The Controller drops it back to `OnDemand` shortly after — see
-/// `on_edit_requested` step 4. NOT the steady-state policy (that's `keyboard_modes`).
-fn apply_keyboard_grab_exclusive(manager: &SurfaceManager, surf_idx: usize) {
-    use gtk4_layer_shell::{KeyboardMode, LayerShell};
-    for (i, surf) in manager.surfaces().iter().enumerate() {
-        let km = if i == surf_idx {
-            KeyboardMode::Exclusive
-        } else {
-            KeyboardMode::None
-        };
-        surf.window.set_keyboard_mode(km);
-    }
-}
-
 fn apply_keyboard_modes(manager: &SurfaceManager, editing_surf: Option<usize>) {
     use gtk4_layer_shell::{KeyboardMode, LayerShell};
     let modes = keyboard_modes(editing_surf, manager.surfaces().len());
