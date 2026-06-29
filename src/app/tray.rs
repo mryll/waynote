@@ -95,16 +95,10 @@ impl ksni::Tray for WaynoteTray {
             }
             .into()
         };
-        // A "fake" separator: real `MenuItem::Separator` is dropped by some hosts
-        // (Waybar's tray), so use a disabled dim-dash row that renders everywhere.
-        let sep = || -> MenuItem<Self> {
-            StandardItem {
-                label: "────────".into(),
-                enabled: false,
-                ..Default::default()
-            }
-            .into()
-        };
+        // Real separators: clean lines in spec-compliant SNI hosts. Some hosts
+        // (Waybar's tray) don't draw them, but the disabled dash-row "fake" looked
+        // broken (indented dashes + big gaps) — a clean flat list beats that.
+        let sep = || -> MenuItem<Self> { MenuItem::Separator };
 
         let mut items: Vec<MenuItem<Self>> = vec![
             item("New note", "document-new", TrayCommand::NewNote),

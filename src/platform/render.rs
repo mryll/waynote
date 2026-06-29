@@ -1209,9 +1209,8 @@ impl NoteView {
         indicator.set_margin_end(4);
         indicator.set_margin_top(2);
         // The pill doubles as the explicit mode toggle (click to edit / save), so
-        // hint that it is clickable. Edit mode is exited explicitly (this pill or
-        // ESC), never on focus-out: OnDemand keyboard focus follows the pointer on
-        // some compositors, so a focus-out would fire on mere hover.
+        // hint that it is clickable. Edit mode is exited explicitly (this pill, ESC,
+        // or clicking another note) — there is no focus-out auto-commit.
         indicator.set_cursor_from_name(Some("pointer"));
 
         let stack = gtk::Stack::new();
