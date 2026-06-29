@@ -108,7 +108,7 @@ seconds.
 
 ```sh
 waynote                             # run the app
-waynote new                         # create a new note (starts the app if needed)
+waynote new [<monitor>]             # create a new note (optionally on a monitor, e.g. DP-2)
 waynote show-all | hide-all | toggle  # show / hide all notes (forwards to the app)
 waynote doctor                      # run diagnostics (D-Bus, SNI tray, paths)
 waynote install-user-assets         # install icon, .desktop, and systemd unit
@@ -119,15 +119,39 @@ waynote --render-demo               # open the markdown render demo window (dev)
 ### Window-manager keybinds
 
 The CLI verbs forward to the already-running instance (starting it if needed), so
-bind them straight from your compositor:
+bind them in your compositor — the same idea on any `wlr-layer-shell` WM.
+
+Hyprland (`~/.config/hypr/hyprland.conf`):
 
 ```ini
-# ~/.config/hypr/hyprland.conf
 bind = SUPER, N, exec, waynote new
 bind = SUPER SHIFT, H, exec, waynote hide-all
 bind = SUPER SHIFT, S, exec, waynote show-all
 bind = SUPER SHIFT, T, exec, waynote toggle      # hide all, or show all if any are hidden
 ```
+
+Sway (`~/.config/sway/config`):
+
+```
+bindsym $mod+n exec waynote new
+bindsym $mod+Shift+h exec waynote hide-all
+bindsym $mod+Shift+s exec waynote show-all
+bindsym $mod+Shift+t exec waynote toggle
+```
+
+> [!TIP]
+> On Wayland an app can't know which monitor has focus, so a new note lands on the
+> monitor under the pointer, else the last-used one, else the primary. To force the
+> note onto the **focused** monitor, pass it explicitly — your compositor knows it:
+>
+> ```ini
+> # Hyprland
+> bind = SUPER, N, exec, waynote new "$(hyprctl activeworkspace -j | jq -r .monitor)"
+> ```
+> ```
+> # Sway
+> bindsym $mod+n exec waynote new "$(swaymsg -t get_workspaces | jq -r '.[]|select(.focused).output')"
+> ```
 
 Any other action — `arrange`, or per-note ones like `set-color`, `toggle-lock`,
 `move-to-monitor` — is available over D-Bus:

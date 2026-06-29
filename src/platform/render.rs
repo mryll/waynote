@@ -164,7 +164,7 @@ const CARD_CSS: &str = "
    Per-color is inherited (the chrome sits inside the coloured card). */
 .waynote-header {
     min-height: 30px;
-    padding: 1px 8px 2px 8px;
+    padding: 1px 0 2px 0;
     border-bottom: 1px solid rgba(0,0,0,0.10);
 }
 .waynote-header-title {
@@ -191,25 +191,30 @@ menubutton.waynote-layer-btn {
 }
 button.waynote-layer-btn,
 menubutton.waynote-layer-btn > button {
-    min-width: 22px;
-    min-height: 22px;
+    min-width: 24px;
+    min-height: 24px;
     padding: 0;
     border-radius: 7px;
     background: transparent;
     background-image: none;
     border: none;
     box-shadow: none;
-    -gtk-icon-size: 13px;
-    font-size: 12px;
+    -gtk-icon-size: 16px;
+    font-size: 14px;
     transition: color 120ms ease-out, background-color 120ms ease-out;
 }
+/* Every icon/glyph gets an identical 16px square box so all header controls are
+   the same size. 16px is the symbolic icons' native grid (1× scale = pixel-perfect
+   and uniform; non-integer scales like 13/16 round per-icon and look uneven). */
 button.waynote-layer-btn image,
 button.waynote-layer-btn label,
 menubutton.waynote-layer-btn > button image,
 menubutton.waynote-layer-btn > button label {
     color: inherit;
     opacity: 0.55;
-    -gtk-icon-size: 13px;
+    -gtk-icon-size: 16px;
+    min-width: 16px;
+    min-height: 16px;
     -gtk-icon-palette: success currentColor, warning currentColor, error currentColor;
 }
 button.waynote-layer-btn:hover image,
@@ -232,6 +237,20 @@ menubutton.waynote-layer-btn:checked > button,
 menubutton.waynote-layer-btn > button:active,
 menubutton.waynote-layer-btn > button:checked {
     background-color: alpha(currentColor, 0.13);
+}
+/* Pinned: the pin button reads as active — full ink + a steady wash (the symbolic
+   set has no separate unpin icon, so the active state carries the meaning). */
+button.waynote-layer-btn.waynote-pinned image,
+button.waynote-layer-btn.waynote-pinned label {
+    opacity: 1.0;
+}
+button.waynote-layer-btn.waynote-pinned {
+    background-color: alpha(currentColor, 0.16);
+}
+/* Disabled (the layer ▲/▼ button while the note is pinned): clearly greyed. */
+button.waynote-layer-btn:disabled image,
+button.waynote-layer-btn:disabled label {
+    opacity: 0.25;
 }
 /* Per-paper ink: muted idle colour (above), full ink on hover/active. */
 .waynote-card.yellow button.waynote-layer-btn,
@@ -1247,7 +1266,7 @@ impl NoteView {
             let nv = this.borrow();
             nv.edit.buffer().set_text(&nv.state.borrow().raw);
             nv.stack.set_visible_child_name(PAGE_EDIT);
-            nv.indicator.set_label("✓ guardar");
+            nv.indicator.set_label("✓ save");
             nv.edit.clone()
         };
         edit.grab_focus();
@@ -1561,7 +1580,7 @@ fn wire_edit_keys(note_view: &Rc<RefCell<NoteView>>) {
 }
 
 /// Make the header mode pill an explicit toggle: in view mode a click requests
-/// edit; in edit mode a click commits (the explicit "✓ guardar" affordance that
+/// edit; in edit mode a click commits (the explicit "✓ save" affordance that
 /// replaces the removed focus-out auto-commit). Borrow discipline mirrors the rest
 /// of the file: snapshot mode/sink under a SHORT borrow, release, then act — the
 /// commit path (`commit_edit_if_editing`) rebuilds the view page and emits, so it
@@ -1652,6 +1671,7 @@ fn use_symbolic_icons() -> bool {
                     "changes-allow-symbolic",
                     "go-up-symbolic",
                     "go-down-symbolic",
+                    "view-pin-symbolic",
                 ]
                 .iter()
                 .all(|n| theme.has_icon(n))
@@ -1670,6 +1690,10 @@ fn set_button_icon(button: &Button, icon_name: &str, glyph: &str) {
     }
 }
 
+/// Exact pixel size of every header control (square). Forced via `set_size_request`
+/// so a `Button` and a `MenuButton` render at identical box + hover-background size.
+const HEADER_BTN_PX: i32 = 24;
+
 /// Apply the shared header-control treatment to a plain `Button` (lock / layer):
 /// frameless + flat, the `.waynote-layer-btn` look, no keyboard focus, and a
 /// pointer cursor (GTK4 sets the cursor via the widget API, not CSS).
@@ -1680,6 +1704,9 @@ fn finish_header_button(button: &Button) {
     button.set_can_focus(false);
     button.set_valign(gtk::Align::Center);
     button.set_cursor_from_name(Some("pointer"));
+    // Force an exact square so every control (and its hover background) is identical;
+    // CSS min-width alone leaves Button vs MenuButton boxes slightly different widths.
+    button.set_size_request(HEADER_BTN_PX, HEADER_BTN_PX);
 }
 
 /// Same shared treatment for a `MenuButton` (colour / monitor pickers) so the four
@@ -1692,6 +1719,9 @@ fn finish_header_menu_button(button: &gtk::MenuButton) {
     button.set_can_focus(false);
     button.set_valign(gtk::Align::Center);
     button.set_cursor_from_name(Some("pointer"));
+    // Exact square — matches the plain header buttons so all boxes/hover backgrounds
+    // are identical (MenuButton's inner toggle otherwise sizes slightly differently).
+    button.set_size_request(HEADER_BTN_PX, HEADER_BTN_PX);
 }
 
 /// Build the per-note colour picker: a `MenuButton` whose popover holds one round
@@ -1752,6 +1782,10 @@ pub struct NoteChrome {
     /// Per-note lock (content read-only) toggle button. The Controller wires its
     /// click + updates its glyph/tooltip via `set_locked`.
     pub lock_button: Button,
+    /// Per-note "pin" toggle. A pinned note is anchored: exempt from hide-all and
+    /// from durable layer changes (its `layer_button` is disabled). The Controller
+    /// wires its click + updates state via `set_pinned`.
+    pub pin_button: Button,
     /// Per-note "move to monitor" button: a `MenuButton` whose popover lists the
     /// available monitors. Hidden unless there is more than one; the Controller
     /// populates the menu via `set_monitor_menu`.
@@ -1818,6 +1852,10 @@ impl NoteChrome {
         let lock_button = Button::new();
         finish_header_button(&lock_button);
 
+        // Pin toggle button: shared header treatment; icon/state set by `set_pinned`.
+        let pin_button = Button::new();
+        finish_header_button(&pin_button);
+
         // Colour picker button: a MenuButton whose popover holds the swatches.
         let color_button = build_color_button(&note_view.borrow().handler_sink());
 
@@ -1850,6 +1888,7 @@ impl NoteChrome {
         controls.append(&color_button);
         controls.append(&lock_button);
         controls.append(&layer_button);
+        controls.append(&pin_button);
         controls.append(&monitor_button);
         controls.append(&delete_button);
         controls.set_can_focus(false);
@@ -1890,6 +1929,7 @@ impl NoteChrome {
             drag_handle,
             layer_button,
             lock_button,
+            pin_button,
             monitor_button,
             delete_button,
             grip,
@@ -1902,6 +1942,7 @@ impl NoteChrome {
         // via `set_layer`/`set_locked` immediately after construction.
         chrome.set_layer(&Layer::Front);
         chrome.set_locked(false);
+        chrome.set_pinned(false);
         chrome
     }
 
@@ -1935,6 +1976,28 @@ impl NoteChrome {
         };
         set_button_icon(&self.lock_button, icon, glyph);
         self.lock_button.set_tooltip_text(Some(tip));
+    }
+
+    /// Update the pin-toggle button to reflect the note's `pinned` (anchored) state.
+    /// The pin icon is the same in both states (the symbolic set has no "unpin"); the
+    /// `.waynote-pinned` class makes the pinned state read as active. While pinned the
+    /// layer ▲/▼ button is disabled, since a pinned note's layer is frozen.
+    pub fn set_pinned(&self, pinned: bool) {
+        use gtk::prelude::WidgetExt;
+        set_button_icon(&self.pin_button, "view-pin-symbolic", "📌");
+        let tip = if pinned {
+            "Unpin (unfreeze layer)"
+        } else {
+            "Pin to current layer"
+        };
+        self.pin_button.set_tooltip_text(Some(tip));
+        if pinned {
+            self.pin_button.add_css_class("waynote-pinned");
+        } else {
+            self.pin_button.remove_css_class("waynote-pinned");
+        }
+        // A pinned note's layer is frozen: disable the ▲/▼ toggle.
+        self.layer_button.set_sensitive(!pinned);
     }
 
     /// Populate the "move to monitor" menu with one row per *destination* monitor

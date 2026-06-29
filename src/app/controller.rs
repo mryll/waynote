@@ -586,6 +586,22 @@ fn wire_lock_button(
     });
 }
 
+/// Wire the per-note pin button: click toggles the note's anchored (`pinned`) flag.
+fn wire_pin_button(
+    button: &gtk::Button,
+    weak: std::rc::Weak<RefCell<Controller>>,
+    id: NoteId,
+) {
+    use gtk::prelude::ButtonExt;
+    button.connect_clicked(move |_| {
+        let (weak, id) = (weak.clone(), id.clone());
+        glib::idle_add_local_once(move || {
+            let Some(ctrl) = weak.upgrade() else { return };
+            Controller::toggle_pin(&ctrl, &id);
+        });
+    });
+}
+
 /// PURE: build the "move to monitor" destinations for a note — `(global index,
 /// label)` for every monitor *except* the one it currently lives on. Empty when
 /// there is nowhere else to move (e.g. a single-monitor setup), which the header
@@ -622,6 +638,7 @@ fn wire_header_buttons(
 ) {
     wire_layer_button(&chrome.layer_button, weak.clone(), id.clone());
     wire_lock_button(&chrome.lock_button, weak.clone(), id.clone());
+    wire_pin_button(&chrome.pin_button, weak.clone(), id.clone());
     wire_delete_button(&chrome.delete_button, weak.clone(), id.clone());
     populate_monitor_menu(chrome, weak, id, monitors, current_monitor);
 }
@@ -888,6 +905,7 @@ fn build_chrome(
     let chrome = render::NoteChrome::new(note_view, &note.title());
     chrome.set_layer(&note.layer);
     chrome.set_locked(note.locked);
+    chrome.set_pinned(note.pinned);
     chrome.root.set_size_request(rect.w, rect.h);
     chrome
 }
@@ -1262,6 +1280,61 @@ pub fn hideable_ids<'a>(
         .collect()
 }
 
+/// PURE: which note ids move on a global "send all to <layer>" — every unpinned
+/// note not already on the target layer. Pinned notes are anchored (their durable
+/// layer is frozen), and notes already on the target need no move.
+pub fn relayer_ids<'a>(
+    entries: impl Iterator<Item = (&'a NoteId, bool, &'a Layer)>,
+    target: &Layer,
+) -> Vec<NoteId> {
+    entries
+        .filter(|(_, pinned, layer)| !pinned && *layer != target)
+        .map(|(id, _, _)| id.clone())
+        .collect()
+}
+
+/// If note `id` is being edited, commit that edit (the real persist is deferred to
+/// idle by the NoteView sink) and schedule `f` on a LATER idle so it runs AFTER the
+/// edit persists; return `true`. Otherwise return `false` and the caller runs `f`
+/// synchronously. Frontmatter-only toggles (pin/lock) must use this: persisting the
+/// toggle BEFORE the queued edit commit makes that commit see an external disk
+/// change and write a spurious conflict copy. Idle callbacks run FIFO, so `f` (queued
+/// after the edit-commit idle) is guaranteed to run last.
+fn defer_after_edit_commit(
+    this: &Rc<RefCell<Controller>>,
+    id: &NoteId,
+    f: fn(&Rc<RefCell<Controller>>, &NoteId),
+) -> bool {
+    // `edit_base_hash.is_some()` means an edit save is in flight for THIS note: either
+    // it is actively being edited, OR a prior action already triggered the commit but the
+    // deferred `on_edit_committed` idle has not persisted yet (which also clears
+    // `active_editor` — so `active_editor` alone is too narrow and a second queued toggle
+    // would re-open the race). In both cases a frontmatter-only save now would jump ahead
+    // of the edit commit and trigger a false conflict copy, so defer past the pending idle.
+    let (is_active, commit_pending) = {
+        let c = this.borrow();
+        (
+            c.active_editor.as_deref() == Some(id),
+            c.entries.get(id).map(|e| e.edit_base_hash.is_some()).unwrap_or(false),
+        )
+    };
+    if !commit_pending {
+        return false;
+    }
+    // Trigger the commit only if still actively editing; if a prior toggle already did,
+    // its `on_edit_committed` idle is queued ahead of ours (GLib idles run FIFO).
+    if is_active {
+        this.borrow_mut().commit_current_editor(id);
+    }
+    let (weak, id) = (Rc::downgrade(this), id.clone());
+    glib::idle_add_local_once(move || {
+        if let Some(ctrl) = weak.upgrade() {
+            f(&ctrl, &id);
+        }
+    });
+    true
+}
+
 impl Controller {
     /// Move note `id` to the Desktop layer (model-driven cross-surface move).
     ///
@@ -1329,6 +1402,55 @@ impl Controller {
         }
     }
 
+    /// Move EVERY note to monitor `target_idx` (tray "Send all notes to monitor").
+    /// Hidden and pinned notes move too — this is geometry, not visibility or layer.
+    /// Commits any active edit first, retargets all geometry in one mutable pass,
+    /// saves the layout once, re-syncs all surfaces once, then rebuilds each note's
+    /// "move to monitor" menu (now anchored on the new monitor, else they go stale).
+    pub fn move_all_to_monitor(this: &Rc<RefCell<Self>>, target_idx: usize) {
+        let active = this.borrow().active_editor.clone();
+        if let Some(active_id) = &active {
+            this.borrow_mut().commit_current_editor(active_id);
+        }
+        {
+            let mut c = this.borrow_mut();
+            let Some(target) = c.monitors.get(target_idx).cloned() else {
+                eprintln!("[waynote] move_all_to_monitor: invalid monitor index {target_idx}");
+                return;
+            };
+            // Phase 1: retarget each entry's geometry; collect (id, geom) for layout.
+            let geoms: Vec<(NoteId, crate::platform::layout::Geometry)> = c
+                .entries
+                .iter_mut()
+                .map(|(id, entry)| {
+                    entry.geometry = retarget_geometry_to_monitor(&entry.geometry, &target);
+                    entry.surface_key.output_id = target.output_id.clone();
+                    (id.clone(), entry.geometry.clone())
+                })
+                .collect();
+            // Phase 2: flush to layout (entries borrow released).
+            for (id, geom) in geoms {
+                c.layout.set(&id, geom);
+            }
+            if let Err(e) = layout::save(&c.paths, &c.layout) {
+                eprintln!("[waynote] move_all_to_monitor: layout save failed: {e}");
+            }
+        }
+        presenter::sync_all(&mut this.borrow_mut());
+
+        let weak = Rc::downgrade(this);
+        let c = this.borrow();
+        for (id, entry) in c.entries.iter() {
+            populate_monitor_menu(&entry.chrome, &weak, id, &c.monitors, target_idx);
+        }
+    }
+
+    /// The `(index, label)` of every monitor, for the tray "Send all notes to
+    /// monitor" submenu. Labels match the per-note menu (`monitor_label`).
+    pub(crate) fn monitor_labels(&self) -> Vec<(usize, String)> {
+        self.monitors.iter().map(|m| (m.index, monitor_label(m))).collect()
+    }
+
     /// Clear `hidden` for every entry and re-sync all surfaces.
     pub fn show_all(this: &Rc<RefCell<Self>>) {
         {
@@ -1370,12 +1492,25 @@ impl Controller {
         }
     }
 
-    /// Flip `note.pinned` for `id` and persist the `.md`.
+    /// Toggle `note.pinned` (anchored: exempt from hide-all + durable layer changes),
+    /// persist the `.md`, and reflect it on the header (pin button + disabled ▲/▼).
+    ///
+    /// If the note is mid-edit, the flip is deferred until after the edit commit
+    /// persists (`defer_after_edit_commit`), so a frontmatter-only save never races
+    /// ahead of the commit and tricks it into writing a spurious conflict copy.
     pub fn toggle_pin(this: &Rc<RefCell<Self>>, id: &NoteId) {
+        if defer_after_edit_commit(this, id, Self::apply_toggle_pin) {
+            return;
+        }
+        Self::apply_toggle_pin(this, id);
+    }
+
+    fn apply_toggle_pin(this: &Rc<RefCell<Self>>, id: &NoteId) {
         let outcome = {
             let mut c = this.borrow_mut();
             let Some(entry) = c.entries.get_mut(id) else { return };
             entry.note.pinned = !entry.note.pinned;
+            entry.chrome.set_pinned(entry.note.pinned);
             persist_entry(entry, now_ts())
         };
         this.borrow_mut().after_persist(id, outcome);
@@ -1386,9 +1521,13 @@ impl Controller {
     /// note can't be in an edit session). Moving/resizing/recolour/pin/delete are
     /// unaffected — `locked` only gates content mutation (edit, checkbox, paste).
     pub fn toggle_lock(this: &Rc<RefCell<Self>>, id: &NoteId) {
-        if this.borrow().active_editor.as_deref() == Some(id) {
-            this.borrow_mut().commit_current_editor(id);
+        if defer_after_edit_commit(this, id, Self::apply_toggle_lock) {
+            return;
         }
+        Self::apply_toggle_lock(this, id);
+    }
+
+    fn apply_toggle_lock(this: &Rc<RefCell<Self>>, id: &NoteId) {
         let outcome = {
             let mut c = this.borrow_mut();
             let Some(entry) = c.entries.get_mut(id) else { return };
@@ -1471,6 +1610,17 @@ impl Controller {
 
     /// Internal: flip a note's layer, persist, and re-sync both surfaces.
     fn set_layer_durable(this: &Rc<RefCell<Self>>, id: &NoteId, new_layer: Layer) {
+        // Pinned notes are anchored (durable layer frozen); same-layer transitions are
+        // no-ops. The UI disables the ▲/▼ button when pinned, but the D-Bus
+        // send-to-desktop / bring-to-front actions can still reach here — guard both.
+        {
+            let c = this.borrow();
+            match c.entries.get(id) {
+                Some(e) if e.note.pinned || e.note.layer == new_layer => return,
+                None => return,
+                _ => {}
+            }
+        }
         // Snapshot old surface index BEFORE mutating the entry's layer.
         let old_surf_idx = presenter::surface_index_for(&this.borrow(), id);
         let outcome = {
@@ -1491,9 +1641,9 @@ impl Controller {
         }
     }
 
-    /// Move EVERY note to the Desktop layer (global "send all to back").
+    /// Move every UNPINNED note to the Desktop layer (global "send all to back").
     ///
-    /// Pinned notes ARE affected (pin = exempt from hide, not from layer).
+    /// Pinned notes are anchored: their durable layer is frozen, so they are skipped.
     pub fn send_all_to_desktop(this: &Rc<RefCell<Self>>) {
         Self::set_all_layers_durable(this, Layer::Desktop);
     }
@@ -1506,8 +1656,8 @@ impl Controller {
     /// Internal: set every note's layer to `new_layer`, persist each changed note,
     /// update its header toggle button, and re-sync ALL surfaces ONCE.
     ///
-    /// - Pinned notes ARE affected (pin only exempts from hide); `hidden` flags are
-    ///   preserved (we never un-hide here).
+    /// - Pinned notes are SKIPPED (pin freezes the durable layer); `hidden` flags
+    ///   are preserved (we never un-hide here).
     /// - Active-editor guard: if a note is mid-edit, it is committed first (the
     ///   `commit_current_editor` path) so we never move it out from under the
     ///   editor — preserving the `on_edit_requested` invariants. That committed
@@ -1522,14 +1672,13 @@ impl Controller {
             this.borrow_mut().commit_current_editor(active_id);
         }
 
-        // Collect every note whose layer differs (read AFTER the commit/restore).
+        // Collect every UNPINNED note whose layer differs (read AFTER commit/restore).
         let ids: Vec<NoteId> = {
             let c = this.borrow();
-            c.entries
-                .iter()
-                .filter(|(_, e)| e.note.layer != new_layer)
-                .map(|(id, _)| id.clone())
-                .collect()
+            relayer_ids(
+                c.entries.iter().map(|(id, e)| (id, e.note.pinned, &e.note.layer)),
+                &new_layer,
+            )
         };
 
         for id in &ids {
@@ -1612,6 +1761,17 @@ impl Controller {
     /// 24 px left/48 px top margin, and a 16 px gap between cells. The surface
     /// bounds are taken from the first monitor's logical rect, or a fallback of
     /// 1920×1080 when no monitor snapshot is available.
+    /// Arrange EVERY surface (each monitor × layer) into its own grid. This is what
+    /// the `arrange` action / tray invoke: the old single-surface `arrange(0)` only
+    /// tidied monitor 0's front notes, so notes on other monitors/layers were left
+    /// untouched ("Arrange does nothing").
+    pub fn arrange_all(this: &Rc<RefCell<Self>>) {
+        let n = this.borrow().manager.surfaces().len();
+        for surf_idx in 0..n {
+            Self::arrange(this, surf_idx);
+        }
+    }
+
     pub fn arrange(this: &Rc<RefCell<Self>>, surf_idx: usize) {
         let (ids, bounds, cell, paths) = {
             let c = this.borrow();
@@ -1945,11 +2105,17 @@ impl Controller {
     /// `actions.rs`). We accept it as a parameter so callers can keep the
     /// Controller alive for the drain's lifetime without capturing it separately.
     pub fn apply_tray_command(
-        _this: &Rc<RefCell<Self>>,
+        this: &Rc<RefCell<Self>>,
         app: &gtk::Application,
         cmd: crate::app::tray::TrayCommand,
     ) {
+        use crate::app::tray::TrayCommand;
         use gtk::prelude::{ActionGroupExt, ApplicationExt};
+        // Parameterized command: handle directly (it carries a monitor index).
+        if let TrayCommand::MoveAllToMonitor(idx) = cmd {
+            Self::move_all_to_monitor(this, idx);
+            return;
+        }
         match crate::app::tray::action_name(cmd) {
             Some(name) => app.activate_action(name, None),
             None => app.quit(),
@@ -2219,6 +2385,19 @@ mod tests {
             ("c".to_string(), false, true),  // already hidden → skip
         ];
         let ids = hideable_ids(rows.iter().map(|(i, p, h)| (i, *p, *h)));
+        assert_eq!(ids, vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn relayer_ids_excludes_pinned_and_already_on_target() {
+        let front = Layer::Front;
+        let desktop = Layer::Desktop;
+        let rows = [
+            ("a".to_string(), false, &front),   // unpinned, on front → moves to desktop
+            ("b".to_string(), true, &front),    // pinned → frozen, skip
+            ("c".to_string(), false, &desktop), // already on target → skip
+        ];
+        let ids = relayer_ids(rows.iter().map(|(i, p, l)| (i, *p, *l)), &desktop);
         assert_eq!(ids, vec!["a".to_string()]);
     }
 

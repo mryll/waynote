@@ -8,6 +8,8 @@
 //!   `send-all-to-desktop`, `bring-all-to-front`.
 //! - String-param actions (note id): `send-to-desktop`, `bring-to-front`,
 //!   `toggle-pin`, `toggle-lock`, `delete`.
+//! - `new-note-on`: param is a monitor connector (e.g. `"DP-2"`); empty string
+//!   means "no explicit monitor" (same fallback as the bare `new-note`).
 //! - `set-color`: param is `"<note-id>:<color>"` (e.g. `"01JZ9...:blue"`).
 //!   ULID ids are uppercase Base32 (no colon), so the first `:` always splits
 //!   id from color unambiguously.
@@ -45,6 +47,7 @@ pub fn register(app: &gtk::Application, ctrl: &Rc<RefCell<Controller>>) {
     register_id_actions(app, ctrl);
     register_set_color(app, ctrl);
     register_move_to_monitor(app, ctrl);
+    register_new_note_on(app, ctrl);
 }
 
 // ── Parameterless actions ─────────────────────────────────────────────────────
@@ -94,8 +97,8 @@ fn add_toggle(app: &gtk::Application, ctrl: Rc<RefCell<Controller>>) {
 fn add_arrange(app: &gtk::Application, ctrl: Rc<RefCell<Controller>>) {
     let action = gio::SimpleAction::new("arrange", None);
     action.connect_activate(move |_, _| {
-        // Arrange surface 0 (Front surface on monitor 0). Future: param for surface.
-        Controller::arrange(&ctrl, 0);
+        // Arrange every surface (all monitors × layers), not just monitor 0's front.
+        Controller::arrange_all(&ctrl);
     });
     app.add_action(&action);
 }
@@ -185,6 +188,21 @@ fn register_set_color(app: &gtk::Application, ctrl: &Rc<RefCell<Controller>>) {
             return;
         };
         Controller::set_color(&ctrl, &id.to_string(), color);
+    });
+    app.add_action(&action);
+}
+
+// ── new-note-on: create a note on a specific monitor (connector) ──────────────
+
+fn register_new_note_on(app: &gtk::Application, ctrl: &Rc<RefCell<Controller>>) {
+    let ctrl = Rc::clone(ctrl);
+    let action = gio::SimpleAction::new("new-note-on", Some(gtk::glib::VariantTy::STRING));
+    action.connect_activate(move |_, param| {
+        let Some(connector) = extract_string(param) else { return };
+        // An empty connector means "no explicit monitor": fall back to the normal
+        // pointer → last-used → primary resolution (same as the bare `new-note`).
+        let explicit = (!connector.is_empty()).then_some(connector);
+        Controller::create_note(&ctrl, explicit.as_deref());
     });
     app.add_action(&action);
 }

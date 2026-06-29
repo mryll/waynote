@@ -110,10 +110,12 @@ enum Cli {
 
 /// A GTK-app invocation: either plain run, or a verb that forwards to the running
 /// instance (compositor keybinds + scripts/agents). Each maps to a remote action.
-#[derive(Debug, PartialEq, Clone, Copy)]
+#[derive(Debug, PartialEq, Clone)]
 enum AppCommand {
     Run,
-    New,
+    /// `waynote new [<monitor>]`: the optional connector (e.g. "DP-2") places the
+    /// note on a specific monitor; `None` falls back to pointer/last/primary.
+    New(Option<String>),
     ShowAll,
     HideAll,
     Toggle,
@@ -122,13 +124,14 @@ enum AppCommand {
 impl AppCommand {
     /// Synthetic argv handed to GApplication so the primary's `command-line`
     /// handler sees the verb (`run_with_args(&[])` would hide it).
-    fn argv(self) -> Vec<&'static str> {
+    fn argv(&self) -> Vec<String> {
         match self {
-            AppCommand::Run => vec!["waynote"],
-            AppCommand::New => vec!["waynote", "new"],
-            AppCommand::ShowAll => vec!["waynote", "show-all"],
-            AppCommand::HideAll => vec!["waynote", "hide-all"],
-            AppCommand::Toggle => vec!["waynote", "toggle"],
+            AppCommand::Run => vec!["waynote".into()],
+            AppCommand::New(None) => vec!["waynote".into(), "new".into()],
+            AppCommand::New(Some(m)) => vec!["waynote".into(), "new".into(), m.clone()],
+            AppCommand::ShowAll => vec!["waynote".into(), "show-all".into()],
+            AppCommand::HideAll => vec!["waynote".into(), "hide-all".into()],
+            AppCommand::Toggle => vec!["waynote".into(), "toggle".into()],
         }
     }
 }
@@ -144,7 +147,7 @@ enum AutostartArg {
 fn parse_cli(args: &[String]) -> Cli {
     match args.first().map(String::as_str) {
         None => Cli::App(AppCommand::Run),
-        Some("new") => Cli::App(AppCommand::New),
+        Some("new") => Cli::App(AppCommand::New(args.get(1).cloned())),
         Some("show-all") => Cli::App(AppCommand::ShowAll),
         Some("hide-all") => Cli::App(AppCommand::HideAll),
         Some("toggle") => Cli::App(AppCommand::Toggle),
@@ -204,19 +207,24 @@ fn run_app(cmd: AppCommand) -> glib::ExitCode {
             .into_iter()
             .map(|s| s.to_string_lossy().into_owned())
             .collect();
-        // args[0] is the (synthetic) program name; args[1] is the verb, if any.
-        let action = match args.get(1).map(String::as_str) {
-            Some("new") => Some("new-note"),
-            Some("show-all") => Some("show-all"),
-            Some("hide-all") => Some("hide-all"),
-            Some("toggle") => Some("toggle"),
+        // args[0] is the (synthetic) program name; args[1] is the verb, if any;
+        // args[2] (for `new`) is an optional monitor connector.
+        let monitor = args.get(2).filter(|m| !m.is_empty()).cloned();
+        let action: Option<(&str, Option<glib::Variant>)> = match args.get(1).map(String::as_str) {
+            Some("new") => Some(match monitor {
+                Some(m) => ("new-note-on", Some(m.to_variant())),
+                None => ("new-note", None),
+            }),
+            Some("show-all") => Some(("show-all", None)),
+            Some("hide-all") => Some(("hide-all", None)),
+            Some("toggle") => Some(("toggle", None)),
             _ => None,
         };
         match action {
-            Some(name) => {
+            Some((name, param)) => {
                 // Ensure the instance is up, then fire the action on it.
                 build_ui_once(app, &built_c);
-                app.activate_action(name, None);
+                app.activate_action(name, param.as_ref());
             }
             None => app.activate(), // no verb → just show the app (build_ui_once)
         }
@@ -332,7 +340,7 @@ fn print_help() {
         "waynote — Wayland markdown sticky notes\n\n\
          USAGE:\n  \
            waynote                        run the app\n  \
-           waynote new                    create a new note (starts the app if needed)\n  \
+           waynote new [<monitor>]        create a new note (optionally on a monitor, e.g. DP-2)\n  \
            waynote show-all               show all notes\n  \
            waynote hide-all               hide all notes (pinned stay)\n  \
            waynote toggle                 hide all, or show all if any are hidden\n  \
@@ -493,16 +501,28 @@ mod tests {
 
     #[test]
     fn app_verbs_parse_to_commands() {
-        assert_eq!(parse_cli(&argv(&["new"])), Cli::App(AppCommand::New));
+        assert_eq!(parse_cli(&argv(&["new"])), Cli::App(AppCommand::New(None)));
         assert_eq!(parse_cli(&argv(&["show-all"])), Cli::App(AppCommand::ShowAll));
         assert_eq!(parse_cli(&argv(&["hide-all"])), Cli::App(AppCommand::HideAll));
         assert_eq!(parse_cli(&argv(&["toggle"])), Cli::App(AppCommand::Toggle));
     }
 
     #[test]
+    fn new_verb_captures_optional_monitor() {
+        assert_eq!(
+            parse_cli(&argv(&["new", "DP-2"])),
+            Cli::App(AppCommand::New(Some("DP-2".to_string())))
+        );
+    }
+
+    #[test]
     fn app_command_argv_includes_the_verb() {
         assert_eq!(AppCommand::Run.argv(), vec!["waynote"]);
-        assert_eq!(AppCommand::New.argv(), vec!["waynote", "new"]);
+        assert_eq!(AppCommand::New(None).argv(), vec!["waynote", "new"]);
+        assert_eq!(
+            AppCommand::New(Some("DP-2".to_string())).argv(),
+            vec!["waynote", "new", "DP-2"]
+        );
         assert_eq!(AppCommand::Toggle.argv(), vec!["waynote", "toggle"]);
     }
 

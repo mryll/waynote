@@ -24,12 +24,15 @@ pub enum TrayCommand {
     HideAll,
     SendAllToDesktop,
     BringAllToFront,
+    /// Move every note to the monitor at this index (handled directly by
+    /// `apply_tray_command`, not via a registered action — it carries a parameter).
+    MoveAllToMonitor(usize),
     Arrange,
     Quit,
 }
 
-/// PURE: the GApplication action name a TrayCommand maps to, or `None` for
-/// `Quit` (handled as `app.quit()`, not a registered action).
+/// PURE: the GApplication action name a TrayCommand maps to, or `None` for commands
+/// handled directly (`Quit` → `app.quit()`; `MoveAllToMonitor` → controller call).
 pub fn action_name(cmd: TrayCommand) -> Option<&'static str> {
     match cmd {
         TrayCommand::NewNote => Some("new-note"),
@@ -38,14 +41,16 @@ pub fn action_name(cmd: TrayCommand) -> Option<&'static str> {
         TrayCommand::SendAllToDesktop => Some("send-all-to-desktop"),
         TrayCommand::BringAllToFront => Some("bring-all-to-front"),
         TrayCommand::Arrange => Some("arrange"),
-        TrayCommand::Quit => None,
+        TrayCommand::MoveAllToMonitor(_) | TrayCommand::Quit => None,
     }
 }
 
-/// The ksni tray item. Holds only the `Sender` — the only `Send` value captured
-/// from the ksni thread. Never touches the `!Send` Controller or any GTK type.
+/// The ksni tray item. Holds the `Sender` plus a startup snapshot of monitors
+/// (`(index, label)`) for the "Send all to monitor" submenu — both `Send`. Never
+/// touches the `!Send` Controller or any GTK type.
 struct WaynoteTray {
     tx: Sender<TrayCommand>,
+    monitors: Vec<(usize, String)>,
 }
 
 impl ksni::Tray for WaynoteTray {
@@ -65,23 +70,64 @@ impl ksni::Tray for WaynoteTray {
     }
 
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
-        use ksni::menu::{MenuItem, StandardItem};
+        use ksni::menu::{MenuItem, StandardItem, SubMenu};
         let send = |cmd: TrayCommand| {
             move |t: &mut WaynoteTray| {
                 let _ = t.tx.send(cmd);
             }
         };
-        vec![
-            StandardItem { label: "New note".into(), activate: Box::new(send(TrayCommand::NewNote)), ..Default::default() }.into(),
-            StandardItem { label: "Show all".into(), activate: Box::new(send(TrayCommand::ShowAll)), ..Default::default() }.into(),
-            StandardItem { label: "Hide all".into(), activate: Box::new(send(TrayCommand::HideAll)), ..Default::default() }.into(),
-            StandardItem { label: "Send all to back".into(), activate: Box::new(send(TrayCommand::SendAllToDesktop)), ..Default::default() }.into(),
-            StandardItem { label: "Bring all to front".into(), activate: Box::new(send(TrayCommand::BringAllToFront)), ..Default::default() }.into(),
+        // Build a StandardItem with a symbolic icon (icons are best-effort: some SNI
+        // hosts render menu icons, some don't — labels stay self-sufficient).
+        let item = |label: &str, icon: &str, cmd: TrayCommand| -> MenuItem<Self> {
+            StandardItem {
+                label: label.into(),
+                icon_name: icon.into(),
+                activate: Box::new(send(cmd)),
+                ..Default::default()
+            }
+            .into()
+        };
+
+        let mut items: Vec<MenuItem<Self>> = vec![
+            item("New note", "document-new", TrayCommand::NewNote),
             MenuItem::Separator,
-            StandardItem { label: "Arrange".into(), activate: Box::new(send(TrayCommand::Arrange)), ..Default::default() }.into(),
+            item("Show all", "view-reveal-symbolic", TrayCommand::ShowAll),
+            item("Hide all", "view-conceal-symbolic", TrayCommand::HideAll),
             MenuItem::Separator,
-            StandardItem { label: "Quit".into(), activate: Box::new(send(TrayCommand::Quit)), ..Default::default() }.into(),
-        ]
+            item("Send all to back", "go-bottom-symbolic", TrayCommand::SendAllToDesktop),
+            item("Bring all to front", "go-top-symbolic", TrayCommand::BringAllToFront),
+        ];
+
+        // "Send all to monitor →" submenu, one row per monitor. Omitted when there is
+        // only one monitor (nothing to choose).
+        if self.monitors.len() > 1 {
+            let rows: Vec<MenuItem<Self>> = self
+                .monitors
+                .iter()
+                .map(|(idx, label)| {
+                    item(label, "video-display-symbolic", TrayCommand::MoveAllToMonitor(*idx))
+                })
+                .collect();
+            items.push(
+                SubMenu {
+                    // The " →" is a host-independent parent hint: some SNI hosts (e.g.
+                    // Waybar's tray) don't draw a submenu arrow, so the label carries it.
+                    label: "Send all to monitor   →".into(),
+                    icon_name: "video-display-symbolic".into(),
+                    submenu: rows,
+                    ..Default::default()
+                }
+                .into(),
+            );
+        }
+
+        items.extend([
+            MenuItem::Separator,
+            item("Arrange", "view-grid-symbolic", TrayCommand::Arrange),
+            MenuItem::Separator,
+            item("Quit", "application-exit-symbolic", TrayCommand::Quit),
+        ]);
+        items
     }
 }
 
@@ -107,8 +153,12 @@ pub fn start_tray(
 
     let (tx, rx) = std::sync::mpsc::channel::<TrayCommand>();
 
+    // Snapshot the monitors once for the "Send all to monitor" submenu (startup-fixed,
+    // matching the rest of the app's monitor model). `(index, label)` is `Send`.
+    let monitors = ctrl.borrow().monitor_labels();
+
     // Spawn ksni on its own thread. Returns Err if no SNI watcher is available.
-    let tray_item = WaynoteTray { tx };
+    let tray_item = WaynoteTray { tx, monitors };
     let handle = match tray_item.spawn() {
         Ok(h) => h,
         Err(e) => {
@@ -175,5 +225,11 @@ mod tests {
     #[test]
     fn quit_maps_to_none() {
         assert_eq!(action_name(TrayCommand::Quit), None);
+    }
+
+    #[test]
+    fn move_all_to_monitor_maps_to_none() {
+        // Handled directly by apply_tray_command (carries a monitor index), not an action.
+        assert_eq!(action_name(TrayCommand::MoveAllToMonitor(2)), None);
     }
 }
