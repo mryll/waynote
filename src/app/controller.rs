@@ -1695,6 +1695,12 @@ impl Controller {
         if let Err(e) = crate::platform::runtime_prefs::save_confirm_delete(&c.paths, value) {
             eprintln!("[waynote] save confirm_delete failed: {e}");
         }
+        // Re-render the tray so its "Ask before deleting" checkbox reflects the new
+        // state immediately (e.g. when toggled via the delete popover's "Don't ask
+        // again"); otherwise the host shows the stale cached menu.
+        if let Some(h) = &c.tray_handle {
+            h.refresh();
+        }
     }
 
     /// Spec §4.6: an app trash dir, never silent permanent loss. We move into

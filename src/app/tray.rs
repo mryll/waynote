@@ -170,7 +170,16 @@ impl ksni::Tray for WaynoteTray {
 
 /// Keep the tray service alive. Dropped when the app exits.
 pub struct TrayHandle {
-    _handle: ksni::blocking::Handle<WaynoteTray>,
+    handle: ksni::blocking::Handle<WaynoteTray>,
+}
+
+impl TrayHandle {
+    /// Re-render the tray menu so the host re-queries it. Needed when state the menu
+    /// reflects (e.g. the "Ask before deleting" checkbox) changed elsewhere (the
+    /// delete popover) — otherwise the host shows the cached, stale menu.
+    pub fn refresh(&self) {
+        self.handle.update(|_| {});
+    }
 }
 
 /// Start the tray: spawn the ksni item on its own thread (blocking API) and
@@ -224,7 +233,7 @@ pub fn start_tray(
         glib::ControlFlow::Continue
     });
 
-    Some(TrayHandle { _handle: handle })
+    Some(TrayHandle { handle })
 }
 
 #[cfg(test)]
