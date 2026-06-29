@@ -48,6 +48,10 @@ pub struct Controller {
     pub monitors: Vec<MonitorInfo>,
     pub active_editor: Option<NoteId>,
     pub last_monitor: Option<String>,
+    /// The note currently being dragged/resized (for the `.waynote-active` accent).
+    /// Separate from `active_editor` so they can overlap (edit + drag) without one
+    /// clearing the other's active state.
+    pub dragging_note: Option<NoteId>,
     /// Whether deleting a note asks for confirmation first. Shared with the tray
     /// thread (which reads it for its "Ask before deleting" checkmark). Persisted to
     /// `runtime.toml`; defaults from `config.confirm_delete`.
@@ -90,6 +94,7 @@ impl Controller {
             monitors,
             active_editor: None,
             last_monitor: None,
+            dragging_note: None,
             confirm_delete,
             lifted_surface: None,
             drag_input_surface: None,
@@ -352,6 +357,17 @@ impl Controller {
         }
     }
 
+    /// Apply the `.waynote-active` foreground accent to note `id` based on whether it
+    /// is the active editor and/or the note being dragged (the two can overlap, so
+    /// neither clears the other's state).
+    fn refresh_active(&self, id: &NoteId) {
+        if let Some(entry) = self.entries.get(id) {
+            let active = self.active_editor.as_deref() == Some(id)
+                || self.dragging_note.as_deref() == Some(id);
+            entry.chrome.set_active(active);
+        }
+    }
+
     /// Begin an edit session for `id`. The ORDER matters on layer-shell: the
     /// editing surface must own the keyboard (Exclusive) BEFORE the editor grabs
     /// focus, otherwise the caret/typing is unreliable.
@@ -387,6 +403,7 @@ impl Controller {
             entry.edit_base_hash = Some(entry.disk_hash.clone());
         }
         self.active_editor = Some(id.clone());
+        self.refresh_active(id);
 
         // 3. Desktop-layer editing is unreliable: temporarily move the note to Front.
         let is_desktop = self
@@ -421,6 +438,7 @@ impl Controller {
         self.active_editor = None;
         apply_keyboard_modes(&self.manager, None);
         restore_layer_if_needed(self, id);
+        self.refresh_active(id);
     }
 
     /// Adopt the edited raw as the note body, persist it, and refresh the header
@@ -443,6 +461,7 @@ impl Controller {
             apply_keyboard_modes(&self.manager, None);
             restore_layer_if_needed(self, id);
         }
+        self.refresh_active(id);
     }
 
     /// Flip the indexed checkbox, persist, and re-render the NoteView from the new
@@ -610,6 +629,21 @@ fn wire_pin_button(
     });
 }
 
+/// Wire the per-note copy button: click copies the note's raw markdown to the
+/// clipboard. Read-only (no mutation / no widget destruction), so it runs directly.
+fn wire_copy_button(
+    button: &gtk::Button,
+    weak: std::rc::Weak<RefCell<Controller>>,
+    id: NoteId,
+) {
+    use gtk::prelude::ButtonExt;
+    button.connect_clicked(move |_| {
+        if let Some(ctrl) = weak.upgrade() {
+            Controller::copy_to_clipboard(&ctrl, &id);
+        }
+    });
+}
+
 /// PURE: build the "move to monitor" destinations for a note — `(global index,
 /// label)` for every monitor *except* the one it currently lives on. Empty when
 /// there is nowhere else to move (e.g. a single-monitor setup), which the header
@@ -646,6 +680,7 @@ fn wire_header_buttons(
 ) {
     wire_layer_button(&chrome.layer_button, weak.clone(), id.clone());
     wire_lock_button(&chrome.lock_button, weak.clone(), id.clone());
+    wire_copy_button(&chrome.copy_button, weak.clone(), id.clone());
     wire_pin_button(&chrome.pin_button, weak.clone(), id.clone());
     wire_delete_button(&chrome.delete_button, weak.clone(), id.clone());
     populate_monitor_menu(chrome, weak, id, monitors, current_monitor);
@@ -1098,6 +1133,9 @@ impl render::DragResizeHandler for Controller {
 
     fn move_live(&mut self, id: &NoteId, x: i32, y: i32) {
         use gtk::prelude::FixedExt;
+        // Apply the drag-active accent on first motion (the SAFE repaint point — see
+        // begin_pointer_drag). Idempotent, so calling it per motion is fine.
+        self.refresh_active(id);
         // Transient: move ONLY the visual widget. Do NOT mutate durable geometry
         // and do NOT rebuild the input region per motion — rebuilding it mid-drag
         // can drop the pointer outside the freshly-applied region and freeze the
@@ -1120,6 +1158,8 @@ impl render::DragResizeHandler for Controller {
 
     fn resize_live(&mut self, id: &NoteId, w: i32, h: i32) {
         use gtk::prelude::WidgetExt;
+        // Apply the drag-active accent on first motion (safe repaint point). Idempotent.
+        self.refresh_active(id);
         // Transient: resize ONLY the visual widget. Same rationale as `move_live`
         // — no durable geometry mutation, no per-motion region rebuild; reconciled
         // once at `commit_resize`.
@@ -1177,6 +1217,10 @@ impl render::DragResizeHandler for Controller {
 
     fn begin_pointer_drag(&mut self, id: &NoteId) {
         use gtk4_layer_shell::{Layer as ShellLayer, LayerShell};
+        // Mark as the dragged note (for the `.waynote-active` accent). State only — the
+        // visual class is applied in `move_live`/`resize_live` (the first SAFE repaint),
+        // never here: any commit right after begin cancels the just-started GestureDrag.
+        self.dragging_note = Some(id.clone());
         // Defensive: undo any leftover lift / drag region from a prior gesture whose
         // end was missed (cancelled), so nothing gets stuck lifted or capturing.
         if let Some(prev) = self.lifted_surface.take() {
@@ -1218,8 +1262,11 @@ impl render::DragResizeHandler for Controller {
         self.drag_input_surface = Some(surf_idx);
     }
 
-    fn end_pointer_drag(&mut self, _id: &NoteId) {
+    fn end_pointer_drag(&mut self, id: &NoteId) {
         use gtk4_layer_shell::{Layer as ShellLayer, LayerShell};
+        // Clear the drag-active accent (keeps the note active if it's still editing).
+        self.dragging_note = None;
+        self.refresh_active(id);
         // Undo the Overlay lift (Desktop only).
         if let Some(idx) = self.lifted_surface.take() {
             if let Some(surf) = self.manager.surfaces().get(idx) {
@@ -1256,7 +1303,7 @@ fn apply_keyboard_modes(manager: &SurfaceManager, editing_surf: Option<usize>) {
     let modes = keyboard_modes(editing_surf, manager.surfaces().len());
     for (i, mode) in modes.iter().enumerate() {
         let km = match mode {
-            KeyMode::OnDemand => KeyboardMode::OnDemand,
+            KeyMode::Exclusive => KeyboardMode::Exclusive,
             KeyMode::None => KeyboardMode::None,
         };
         manager.surfaces()[i].window.set_keyboard_mode(km);
@@ -1617,6 +1664,19 @@ impl Controller {
 
     /// Move note `id`'s file to the app trash dir, then remove the entry + widget.
     ///
+    /// Copy note `id`'s raw markdown (the full `.md` body, including its `# title`) to
+    /// the system clipboard — one click, no text selection.
+    pub fn copy_to_clipboard(this: &Rc<RefCell<Self>>, id: &NoteId) {
+        use gtk::prelude::DisplayExt;
+        let body = match this.borrow().entries.get(id) {
+            Some(e) => e.note.body.clone(),
+            None => return,
+        };
+        if let Some(display) = gtk::gdk::Display::default() {
+            display.clipboard().set_text(&body);
+        }
+    }
+
     /// Set whether deleting asks for confirmation, update the shared flag (read by
     /// the tray checkmark), and persist it to `runtime.toml` (NOT config.toml).
     pub fn set_confirm_delete(this: &Rc<RefCell<Self>>, value: bool) {

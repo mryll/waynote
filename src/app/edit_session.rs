@@ -1,12 +1,16 @@
 //! Keyboard edit session policy (Task 8).
 //!
 //! Exactly one active edit session at a time. The editing surface gets
-//! `KeyboardMode::OnDemand`; all others stay `None`. `OnDemand` (not `Exclusive`)
-//! is used so the note does NOT grab the compositor's keyboard: clicking another
-//! app moves focus away normally (and we commit the edit on focus-out). Editing a
-//! `Desktop`-layer note is unreliable (Background keyboard focus is compositor-
-//! impl-defined), so the note is temporarily fronted for the edit session — the
-//! editing surface is always a Top/Overlay one where keyboard focus is defined.
+//! `KeyboardMode::Exclusive`; all others stay `None`. `Exclusive` (not `OnDemand`)
+//! is used so the note grabs the compositor's keyboard the moment it enters edit:
+//! a new note (created from a keybind/menu) is typeable immediately, with no click
+//! to focus it. On Wayland an app cannot otherwise force keyboard focus onto a
+//! layer-shell surface, and `OnDemand` is honoured inconsistently across compositors
+//! (e.g. Hyprland), so it left new notes unfocused. The tradeoff: while a note is
+//! being edited the keyboard is captured by it — exit the edit (ESC / save / click
+//! another note) to type elsewhere. Editing a `Desktop`-layer note is unreliable
+//! (Background keyboard focus is compositor-impl-defined), so the note is temporarily
+//! fronted for the edit session — the editing surface is always a Top/Overlay one.
 //!
 //! The PURE functions here (`keyboard_modes`, `needs_temporary_front`) hold the
 //! policy and are unit-tested without GTK. The Controller wires the display side.
@@ -18,12 +22,12 @@ use crate::platform::surfaces::SurfaceLayer;
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum KeyMode {
     None,
-    OnDemand,
+    Exclusive,
 }
 
 /// PURE: which `KeyMode` each surface should have given the editing surface.
 ///
-/// - `editing_surf == Some(idx)` → surface `idx` gets `OnDemand`, all others `None`.
+/// - `editing_surf == Some(idx)` → surface `idx` gets `Exclusive`, all others `None`.
 /// - `editing_surf == None` → all surfaces get `None` (default rest state, per spec §4.4).
 pub fn keyboard_modes(editing_surf: Option<usize>, surf_count: usize) -> Vec<KeyMode> {
     (0..surf_count)
@@ -33,7 +37,7 @@ pub fn keyboard_modes(editing_surf: Option<usize>, surf_count: usize) -> Vec<Key
 
 fn mode_for(idx: usize, editing_surf: Option<usize>) -> KeyMode {
     if editing_surf == Some(idx) {
-        KeyMode::OnDemand
+        KeyMode::Exclusive
     } else {
         KeyMode::None
     }
@@ -55,9 +59,9 @@ mod tests {
     use crate::platform::surfaces::SurfaceLayer;
 
     #[test]
-    fn editing_surface_is_ondemand_others_none() {
+    fn editing_surface_is_exclusive_others_none() {
         let modes = keyboard_modes(Some(1), 3);
-        assert_eq!(modes, vec![KeyMode::None, KeyMode::OnDemand, KeyMode::None]);
+        assert_eq!(modes, vec![KeyMode::None, KeyMode::Exclusive, KeyMode::None]);
     }
 
     #[test]
@@ -79,6 +83,6 @@ mod tests {
 
     #[test]
     fn keyboard_modes_single_surface_with_editor() {
-        assert_eq!(keyboard_modes(Some(0), 1), vec![KeyMode::OnDemand]);
+        assert_eq!(keyboard_modes(Some(0), 1), vec![KeyMode::Exclusive]);
     }
 }

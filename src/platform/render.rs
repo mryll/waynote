@@ -75,6 +75,18 @@ const CARD_CSS: &str = "
     background: #F6D9B8;
     border: 1px solid #E8C49A;
 }
+/* Foreground feedback. Hover: a faint border darken so you can tell the pointer is
+   over a note. Active (editing / dragging / resizing): a clear accent ring + deeper
+   shadow so the foreground note is unmistakable. Only border-COLOUR and box-shadow
+   change (never border width) so the card never reflows. `.waynote-active` is listed
+   after `:hover`, so it wins when a note is both. */
+.waynote-card:hover {
+    border-color: rgba(0,0,0,0.30);
+}
+.waynote-card.waynote-active {
+    border-color: #3A86FF;
+    box-shadow: 0 0 0 2px rgba(58,134,255,0.55), 0 6px 18px rgba(0,0,0,0.45);
+}
 /* Colour-picker popover: a row of round swatches, one per palette colour. The
    swatch shows the colour itself (its own dedicated class — NOT .waynote-card,
    which carries padding/shadow/card semantics). */
@@ -1774,6 +1786,8 @@ pub struct NoteChrome {
     /// Per-note lock (content read-only) toggle button. The Controller wires its
     /// click + updates its glyph/tooltip via `set_locked`.
     pub lock_button: Button,
+    /// Per-note "copy to clipboard" button — copies the note's raw markdown.
+    pub copy_button: Button,
     /// Per-note "pin" toggle. A pinned note is anchored: exempt from hide-all and
     /// from durable layer changes (its `layer_button` is disabled). The Controller
     /// wires its click + updates state via `set_pinned`.
@@ -1854,8 +1868,15 @@ impl NoteChrome {
         let pin_button = Button::new();
         finish_header_button(&pin_button);
 
-        // Colour picker button: a MenuButton whose popover holds the swatches.
+        // Colour picker button (Button + manual swatch popover).
         let color_button = build_color_button(&note_view.borrow().handler_sink());
+
+        // Copy-to-clipboard button: copies the note's raw markdown; wired by the
+        // Controller (`wire_copy_button`).
+        let copy_button = Button::new();
+        finish_header_button(&copy_button);
+        set_button_icon(&copy_button, "edit-copy-symbolic", "⎘");
+        copy_button.set_tooltip_text(Some("Copy to clipboard"));
 
         // "Move to monitor" button: a plain Button; the Controller fills its popover
         // (stored in `monitor_popover`) via `set_monitor_menu`. Hidden until enabled
@@ -1888,6 +1909,7 @@ impl NoteChrome {
         let controls = gtk::Box::new(Orientation::Horizontal, 0);
         controls.append(&conflict_label);
         controls.append(&color_button);
+        controls.append(&copy_button);
         controls.append(&lock_button);
         controls.append(&layer_button);
         controls.append(&pin_button);
@@ -1931,6 +1953,7 @@ impl NoteChrome {
             drag_handle,
             layer_button,
             lock_button,
+            copy_button,
             pin_button,
             monitor_button,
             monitor_popover,
@@ -2040,6 +2063,16 @@ impl NoteChrome {
         popover.set_parent(&self.monitor_button);
         *self.monitor_popover.borrow_mut() = Some(popover);
         self.monitor_button.set_visible(true);
+    }
+
+    /// Toggle the `.waynote-active` accent on the card — set while the note is the
+    /// foreground one (being edited, dragged, or resized) so it's visually distinct.
+    pub fn set_active(&self, active: bool) {
+        if active {
+            self.column.add_css_class("waynote-active");
+        } else {
+            self.column.remove_css_class("waynote-active");
+        }
     }
 
     /// Recolour the card: swap the column's paper-colour CSS class and re-render
