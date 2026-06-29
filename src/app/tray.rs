@@ -137,17 +137,21 @@ impl ksni::Tray for WaynoteTray {
         items.push(item("Arrange", "view-grid-symbolic", TrayCommand::Arrange));
 
         // "Ask before deleting" toggle. A `CheckmarkItem`'s native checkmark isn't
-        // drawn by some hosts (Waybar), so the state lives in the LABEL as a ☑/☐ glyph
-        // (renders everywhere). Activation flips the shared flag immediately (so the
-        // menu is consistent) and sends it for the GTK thread to persist.
+        // drawn by some hosts (Waybar), so the state is shown by the ICON column (like
+        // every other item, so it stays aligned): a checked vs empty checkbox symbolic.
+        // Activation flips the shared flag immediately (so the menu is consistent) and
+        // sends it for the GTK thread to persist.
         items.push(sep());
         let confirm_on = self.confirm_delete.load(std::sync::atomic::Ordering::Relaxed);
         items.push(
             StandardItem {
-                label: format!(
-                    "{}  Ask before deleting",
-                    if confirm_on { "☑" } else { "☐" }
-                ),
+                label: "Ask before deleting".into(),
+                icon_name: if confirm_on {
+                    "checkbox-checked-symbolic"
+                } else {
+                    "checkbox-symbolic"
+                }
+                .into(),
                 activate: Box::new(|t: &mut WaynoteTray| {
                     let next = !t.confirm_delete.load(std::sync::atomic::Ordering::Relaxed);
                     t.confirm_delete.store(next, std::sync::atomic::Ordering::Relaxed);
