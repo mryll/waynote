@@ -1704,37 +1704,21 @@ fn finish_header_button(button: &Button) {
     button.set_can_focus(false);
     button.set_valign(gtk::Align::Center);
     button.set_cursor_from_name(Some("pointer"));
-    // Force an exact square so every control (and its hover background) is identical;
-    // CSS min-width alone leaves Button vs MenuButton boxes slightly different widths.
-    button.set_size_request(HEADER_BTN_PX, HEADER_BTN_PX);
-}
-
-/// Same shared treatment for a `MenuButton` (colour / monitor pickers) so the four
-/// header controls look and behave identically (the MenuButton's internal toggle
-/// otherwise shows Adwaita's raised/hover frame).
-fn finish_header_menu_button(button: &gtk::MenuButton) {
-    button.set_has_frame(false);
-    button.add_css_class("flat");
-    button.add_css_class("waynote-layer-btn");
-    button.set_can_focus(false);
-    button.set_valign(gtk::Align::Center);
-    button.set_cursor_from_name(Some("pointer"));
-    // Exact square — matches the plain header buttons so all boxes/hover backgrounds
-    // are identical (MenuButton's inner toggle otherwise sizes slightly differently).
+    // Force an exact square so every control (and its hover background) is identical.
+    // All header controls are now plain `Button`s (color/monitor/delete use a manually
+    // parented Popover), so there's a single treatment and sizing is uniform.
     button.set_size_request(HEADER_BTN_PX, HEADER_BTN_PX);
 }
 
 /// Build the per-note colour picker: a `MenuButton` whose popover holds one round
 /// swatch per palette colour. Picking a swatch emits `ColorRequested` (routed to
 /// the Controller, which persists + recolours) and dismisses the popover.
-fn build_color_button(sink: &EventSink) -> gtk::MenuButton {
-    let color_button = gtk::MenuButton::new();
-    finish_header_menu_button(&color_button);
-    if use_symbolic_icons() {
-        color_button.set_icon_name("color-select-symbolic");
-    } else {
-        color_button.set_label("●");
-    }
+fn build_color_button(sink: &EventSink) -> Button {
+    // A plain Button (not MenuButton) with a manually-parented Popover, so every
+    // header control is the same widget type and renders at an identical size/hover.
+    let color_button = Button::new();
+    finish_header_button(&color_button);
+    set_button_icon(&color_button, "color-select-symbolic", "●");
     color_button.set_tooltip_text(Some("Change note colour"));
 
     let popover = gtk::Popover::new();
@@ -1744,7 +1728,15 @@ fn build_color_button(sink: &EventSink) -> gtk::MenuButton {
         palette.append(&build_color_swatch(color, sink, &popover));
     }
     popover.set_child(Some(&palette));
-    color_button.set_popover(Some(&popover));
+    // Parent the popover to the button (cleaned up with the button's subtree) and
+    // pop it up on click — what MenuButton did internally.
+    popover.set_parent(&color_button);
+    let pop = popover.downgrade();
+    color_button.connect_clicked(move |_| {
+        if let Some(p) = pop.upgrade() {
+            p.popup();
+        }
+    });
     color_button
 }
 
@@ -1786,13 +1778,19 @@ pub struct NoteChrome {
     /// from durable layer changes (its `layer_button` is disabled). The Controller
     /// wires its click + updates state via `set_pinned`.
     pub pin_button: Button,
-    /// Per-note "move to monitor" button: a `MenuButton` whose popover lists the
-    /// available monitors. Hidden unless there is more than one; the Controller
-    /// populates the menu via `set_monitor_menu`.
-    pub monitor_button: gtk::MenuButton,
-    /// Per-note "delete" button: a `MenuButton` whose popover (built by the
-    /// Controller) asks for confirmation before the note is moved to trash.
-    pub delete_button: gtk::MenuButton,
+    /// Per-note "move to monitor" button: a plain `Button` with a manually-parented
+    /// popover (`monitor_popover`) listing the available monitors. Hidden unless
+    /// there is more than one; the Controller populates it via `set_monitor_menu`.
+    pub monitor_button: Button,
+    /// The monitor button's current popover. Stored so `set_monitor_menu` can pop it
+    /// down + unparent it before replacing it (a plain Button, unlike `MenuButton`,
+    /// does not own/replace its popover for us). The button's click pops up whatever
+    /// is here.
+    monitor_popover: std::rc::Rc<std::cell::RefCell<Option<gtk::Popover>>>,
+    /// Per-note "delete" button: a plain `Button`; the Controller (`wire_delete_button`)
+    /// parents a confirmation popover and decides on click whether to confirm or
+    /// delete directly (per the `confirm_delete` preference).
+    pub delete_button: Button,
     /// Bottom-right resize handle (Task 9 attaches a `GestureDrag` here). A styled
     /// glyph `Label` rather than a `gtk::Image`: an icon-theme-independent glyph is
     /// always visible, whereas a diagonal-resize symbolic icon is not portable.
@@ -1859,27 +1857,31 @@ impl NoteChrome {
         // Colour picker button: a MenuButton whose popover holds the swatches.
         let color_button = build_color_button(&note_view.borrow().handler_sink());
 
-        // "Move to monitor" button: a MenuButton whose popover the Controller fills
-        // with the available monitors. Hidden until enabled (more than one monitor).
-        let monitor_button = gtk::MenuButton::new();
-        finish_header_menu_button(&monitor_button);
-        if use_symbolic_icons() {
-            monitor_button.set_icon_name("video-display-symbolic");
-        } else {
-            monitor_button.set_label("⧉");
-        }
+        // "Move to monitor" button: a plain Button; the Controller fills its popover
+        // (stored in `monitor_popover`) via `set_monitor_menu`. Hidden until enabled
+        // (more than one monitor). Click pops up whatever popover is currently set.
+        let monitor_button = Button::new();
+        finish_header_button(&monitor_button);
+        set_button_icon(&monitor_button, "video-display-symbolic", "⧉");
         monitor_button.set_tooltip_text(Some("Move to monitor…"));
         monitor_button.set_visible(false);
-
-        // "Delete note" button: a MenuButton whose popover the Controller fills with
-        // a confirmation prompt (deletion moves the note to the app trash).
-        let delete_button = gtk::MenuButton::new();
-        finish_header_menu_button(&delete_button);
-        if use_symbolic_icons() {
-            delete_button.set_icon_name("user-trash-symbolic");
-        } else {
-            delete_button.set_label("🗑");
+        let monitor_popover: std::rc::Rc<std::cell::RefCell<Option<gtk::Popover>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        {
+            let mp = monitor_popover.clone();
+            monitor_button.connect_clicked(move |_| {
+                if let Some(p) = mp.borrow().as_ref() {
+                    p.popup();
+                }
+            });
         }
+
+        // "Delete note" button: a plain Button; the Controller (`wire_delete_button`)
+        // parents a confirmation popover and decides on click whether to confirm or
+        // delete directly (moves the note to the app trash).
+        let delete_button = Button::new();
+        finish_header_button(&delete_button);
+        set_button_icon(&delete_button, "user-trash-symbolic", "🗑");
         delete_button.set_tooltip_text(Some("Delete note"));
 
         // Controls cluster: conflict pill + colour + lock + layer + monitor + delete.
@@ -1931,6 +1933,7 @@ impl NoteChrome {
             lock_button,
             pin_button,
             monitor_button,
+            monitor_popover,
             delete_button,
             grip,
             title: title_label,
@@ -2005,6 +2008,13 @@ impl NoteChrome {
     /// by the Controller); choosing a row calls `on_select(index)`. The button is
     /// shown only when there is at least one other monitor to move to.
     pub fn set_monitor_menu(&self, items: &[String], on_select: Rc<dyn Fn(usize)>) {
+        use gtk::prelude::WidgetExt;
+        // Replace any previous popover ourselves (a plain Button doesn't own it like a
+        // MenuButton did): pop it down and unparent it before building the new one.
+        if let Some(old) = self.monitor_popover.borrow_mut().take() {
+            old.popdown();
+            old.unparent();
+        }
         if items.is_empty() {
             self.monitor_button.set_visible(false);
             return;
@@ -2027,7 +2037,8 @@ impl NoteChrome {
             list.append(&row);
         }
         popover.set_child(Some(&list));
-        self.monitor_button.set_popover(Some(&popover));
+        popover.set_parent(&self.monitor_button);
+        *self.monitor_popover.borrow_mut() = Some(popover);
         self.monitor_button.set_visible(true);
     }
 

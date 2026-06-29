@@ -682,7 +682,7 @@ fn populate_monitor_menu(
 /// this note's widget subtree — which contains the very popover button being
 /// clicked — so it must not run while that click handler is still on the stack.
 fn wire_delete_button(
-    button: &gtk::MenuButton,
+    button: &gtk::Button,
     weak: std::rc::Weak<RefCell<Controller>>,
     id: NoteId,
 ) {
@@ -710,7 +710,15 @@ fn wire_delete_button(
     body.append(&hint);
     body.append(&actions);
     popover.set_child(Some(&body));
-    button.set_popover(Some(&popover));
+    // Parent the confirmation popover to the (plain) delete button and pop it up on
+    // click — what MenuButton did internally before the uniform-button refactor.
+    popover.set_parent(button);
+    let pop = popover.downgrade();
+    button.connect_clicked(move |_| {
+        if let Some(p) = pop.upgrade() {
+            p.popup();
+        }
+    });
 
     let pop = popover.downgrade();
     cancel.connect_clicked(move |_| {
