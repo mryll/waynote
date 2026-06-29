@@ -28,6 +28,9 @@ pub enum TrayCommand {
     /// `apply_tray_command`, not via a registered action — it carries a parameter).
     MoveAllToMonitor(usize),
     Arrange,
+    /// Set whether deleting a note asks for confirmation first (carries the new
+    /// value explicitly — not a toggle — to avoid stale/double-toggle).
+    SetAskBeforeDelete(bool),
     Quit,
 }
 
@@ -41,7 +44,9 @@ pub fn action_name(cmd: TrayCommand) -> Option<&'static str> {
         TrayCommand::SendAllToDesktop => Some("send-all-to-desktop"),
         TrayCommand::BringAllToFront => Some("bring-all-to-front"),
         TrayCommand::Arrange => Some("arrange"),
-        TrayCommand::MoveAllToMonitor(_) | TrayCommand::Quit => None,
+        TrayCommand::MoveAllToMonitor(_)
+        | TrayCommand::SetAskBeforeDelete(_)
+        | TrayCommand::Quit => None,
     }
 }
 
@@ -51,6 +56,9 @@ pub fn action_name(cmd: TrayCommand) -> Option<&'static str> {
 struct WaynoteTray {
     tx: Sender<TrayCommand>,
     monitors: Vec<(usize, String)>,
+    /// Shared with the Controller: the live "confirm before delete" flag, read here
+    /// for the "Ask before deleting" checkmark's checked state.
+    confirm_delete: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ksni::Tray for WaynoteTray {
@@ -70,7 +78,7 @@ impl ksni::Tray for WaynoteTray {
     }
 
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
-        use ksni::menu::{MenuItem, StandardItem, SubMenu};
+        use ksni::menu::{CheckmarkItem, MenuItem, StandardItem, SubMenu};
         let send = |cmd: TrayCommand| {
             move |t: &mut WaynoteTray| {
                 let _ = t.tx.send(cmd);
@@ -87,13 +95,23 @@ impl ksni::Tray for WaynoteTray {
             }
             .into()
         };
+        // A "fake" separator: real `MenuItem::Separator` is dropped by some hosts
+        // (Waybar's tray), so use a disabled dim-dash row that renders everywhere.
+        let sep = || -> MenuItem<Self> {
+            StandardItem {
+                label: "────────".into(),
+                enabled: false,
+                ..Default::default()
+            }
+            .into()
+        };
 
         let mut items: Vec<MenuItem<Self>> = vec![
             item("New note", "document-new", TrayCommand::NewNote),
-            MenuItem::Separator,
+            sep(),
             item("Show all", "view-reveal-symbolic", TrayCommand::ShowAll),
             item("Hide all", "view-conceal-symbolic", TrayCommand::HideAll),
-            MenuItem::Separator,
+            sep(),
             item("Send all to back", "go-bottom-symbolic", TrayCommand::SendAllToDesktop),
             item("Bring all to front", "go-top-symbolic", TrayCommand::BringAllToFront),
         ];
@@ -121,12 +139,29 @@ impl ksni::Tray for WaynoteTray {
             );
         }
 
-        items.extend([
-            MenuItem::Separator,
-            item("Arrange", "view-grid-symbolic", TrayCommand::Arrange),
-            MenuItem::Separator,
-            item("Quit", "application-exit-symbolic", TrayCommand::Quit),
-        ]);
+        items.push(sep());
+        items.push(item("Arrange", "view-grid-symbolic", TrayCommand::Arrange));
+
+        // "Ask before deleting" toggle. The checkmark reflects the live shared flag;
+        // activation computes the next value, stores it immediately (so the menu is
+        // consistent), then sends it for the GTK thread to persist.
+        items.push(sep());
+        items.push(
+            CheckmarkItem {
+                label: "Ask before deleting".into(),
+                checked: self.confirm_delete.load(std::sync::atomic::Ordering::Relaxed),
+                activate: Box::new(|t: &mut WaynoteTray| {
+                    let next = !t.confirm_delete.load(std::sync::atomic::Ordering::Relaxed);
+                    t.confirm_delete.store(next, std::sync::atomic::Ordering::Relaxed);
+                    let _ = t.tx.send(TrayCommand::SetAskBeforeDelete(next));
+                }),
+                ..Default::default()
+            }
+            .into(),
+        );
+
+        items.push(sep());
+        items.push(item("Quit", "application-exit-symbolic", TrayCommand::Quit));
         items
     }
 }
@@ -156,9 +191,11 @@ pub fn start_tray(
     // Snapshot the monitors once for the "Send all to monitor" submenu (startup-fixed,
     // matching the rest of the app's monitor model). `(index, label)` is `Send`.
     let monitors = ctrl.borrow().monitor_labels();
+    // Share the confirm-delete flag with the tray (read for the checkmark state).
+    let confirm_delete = ctrl.borrow().confirm_delete.clone();
 
     // Spawn ksni on its own thread. Returns Err if no SNI watcher is available.
-    let tray_item = WaynoteTray { tx, monitors };
+    let tray_item = WaynoteTray { tx, monitors, confirm_delete };
     let handle = match tray_item.spawn() {
         Ok(h) => h,
         Err(e) => {
@@ -231,5 +268,11 @@ mod tests {
     fn move_all_to_monitor_maps_to_none() {
         // Handled directly by apply_tray_command (carries a monitor index), not an action.
         assert_eq!(action_name(TrayCommand::MoveAllToMonitor(2)), None);
+    }
+
+    #[test]
+    fn set_ask_before_delete_maps_to_none() {
+        // Handled directly by apply_tray_command (carries a value), not an action.
+        assert_eq!(action_name(TrayCommand::SetAskBeforeDelete(false)), None);
     }
 }

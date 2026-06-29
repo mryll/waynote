@@ -48,6 +48,10 @@ pub struct Controller {
     pub monitors: Vec<MonitorInfo>,
     pub active_editor: Option<NoteId>,
     pub last_monitor: Option<String>,
+    /// Whether deleting a note asks for confirmation first. Shared with the tray
+    /// thread (which reads it for its "Ask before deleting" checkmark). Persisted to
+    /// `runtime.toml`; defaults from `config.confirm_delete`.
+    pub confirm_delete: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Surface index temporarily lifted to `Overlay` for the duration of a
     /// pointer drag/resize on a Desktop-layer note (restored on gesture end).
     /// `None` when no drag is lifting a surface.
@@ -70,6 +74,9 @@ impl Controller {
     pub fn new(manager: SurfaceManager, paths: Paths, monitors: Vec<MonitorInfo>) -> Rc<RefCell<Self>> {
         let config = config::load(&paths);
         let layout = layout::load(&paths);
+        let confirm_delete = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+            crate::platform::runtime_prefs::load_confirm_delete(&paths, config.confirm_delete),
+        ));
         let surf_count = manager.surfaces().len();
         Rc::new(RefCell::new(Self {
             manager,
@@ -83,6 +90,7 @@ impl Controller {
             monitors,
             active_editor: None,
             last_monitor: None,
+            confirm_delete,
             lifted_surface: None,
             drag_input_surface: None,
             watch_guard: None,
@@ -696,6 +704,8 @@ fn wire_delete_button(
     let hint = gtk::Label::new(Some("It will be moved to the trash."));
     hint.add_css_class("dim-label");
     hint.set_halign(gtk::Align::Start);
+    let dont_ask = gtk::CheckButton::with_label("Don't ask again");
+    dont_ask.set_halign(gtk::Align::Start);
 
     let actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     actions.set_halign(gtk::Align::End);
@@ -708,16 +718,37 @@ fn wire_delete_button(
 
     body.append(&prompt);
     body.append(&hint);
+    body.append(&dont_ask);
     body.append(&actions);
     popover.set_child(Some(&body));
-    // Parent the confirmation popover to the (plain) delete button and pop it up on
-    // click — what MenuButton did internally before the uniform-button refactor.
+    // Parent the confirmation popover to the (plain) delete button (cleaned up with
+    // the button's subtree).
     popover.set_parent(button);
+
+    // Click: if "confirm before delete" is OFF, delete straight away (deferred to idle
+    // — `delete_to_trash` destroys this button's subtree); otherwise pop up the prompt.
     let pop = popover.downgrade();
+    let weak_click = weak.clone();
+    let id_click = id.clone();
     button.connect_clicked(move |_| {
-        if let Some(p) = pop.upgrade() {
-            p.popup();
+        let confirm_on = weak_click
+            .upgrade()
+            .map(|c| c.borrow().confirm_delete.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap_or(true);
+        if confirm_on {
+            if let Some(p) = pop.upgrade() {
+                p.popup();
+            }
+            return;
         }
+        let (weak, id) = (weak_click.clone(), id_click.clone());
+        glib::idle_add_local_once(move || {
+            if let Some(ctrl) = weak.upgrade() {
+                if let Err(e) = Controller::delete_to_trash(&ctrl, &id) {
+                    eprintln!("[waynote] delete: trash failed for {id}: {e}");
+                }
+            }
+        });
     });
 
     let pop = popover.downgrade();
@@ -728,13 +759,18 @@ fn wire_delete_button(
     });
 
     let pop = popover.downgrade();
+    let dont_ask_weak = dont_ask.downgrade();
     confirm.connect_clicked(move |_| {
         if let Some(p) = pop.upgrade() {
             p.popdown();
         }
+        let stop_asking = dont_ask_weak.upgrade().map(|c| c.is_active()).unwrap_or(false);
         let (weak, id) = (weak.clone(), id.clone());
         glib::idle_add_local_once(move || {
             if let Some(ctrl) = weak.upgrade() {
+                if stop_asking {
+                    Controller::set_confirm_delete(&ctrl, false);
+                }
                 if let Err(e) = Controller::delete_to_trash(&ctrl, &id) {
                     eprintln!("[waynote] delete: trash failed for {id}: {e}");
                 }
@@ -1581,6 +1617,16 @@ impl Controller {
 
     /// Move note `id`'s file to the app trash dir, then remove the entry + widget.
     ///
+    /// Set whether deleting asks for confirmation, update the shared flag (read by
+    /// the tray checkmark), and persist it to `runtime.toml` (NOT config.toml).
+    pub fn set_confirm_delete(this: &Rc<RefCell<Self>>, value: bool) {
+        let c = this.borrow();
+        c.confirm_delete.store(value, std::sync::atomic::Ordering::Relaxed);
+        if let Err(e) = crate::platform::runtime_prefs::save_confirm_delete(&c.paths, value) {
+            eprintln!("[waynote] save confirm_delete failed: {e}");
+        }
+    }
+
     /// Spec §4.6: an app trash dir, never silent permanent loss. We move into
     /// `<data>/waynote/trash/` ourselves (reliable across all wlr compositors —
     /// the `trash` crate's D-Bus portal backend silently no-ops on some Wayland
@@ -2119,9 +2165,14 @@ impl Controller {
     ) {
         use crate::app::tray::TrayCommand;
         use gtk::prelude::{ActionGroupExt, ApplicationExt};
-        // Parameterized command: handle directly (it carries a monitor index).
+        // Parameterized commands: handle directly (they carry a value).
         if let TrayCommand::MoveAllToMonitor(idx) = cmd {
             Self::move_all_to_monitor(this, idx);
+            return;
+        }
+        if let TrayCommand::SetAskBeforeDelete(value) = cmd {
+            // The tray already updated the shared atomic; persist it to runtime.toml.
+            Self::set_confirm_delete(this, value);
             return;
         }
         match crate::app::tray::action_name(cmd) {

@@ -63,6 +63,13 @@ impl Paths {
         self.state.join("waynote").join("layout.toml")
     }
 
+    /// Path to the app-managed runtime prefs: `<state>/waynote/runtime.toml`.
+    /// Holds UI toggles (e.g. confirm-before-delete) that the app/tray change —
+    /// kept OUT of the user's hand-editable config.toml.
+    pub fn runtime_prefs_file(&self) -> PathBuf {
+        self.state.join("waynote").join("runtime.toml")
+    }
+
     /// Path to the config file: `<config>/waynote/config.toml`
     pub fn config_file(&self) -> PathBuf {
         self.config.join("waynote").join("config.toml")

@@ -22,6 +22,10 @@ pub struct Config {
     pub geometry_save_debounce_ms: u64,
     pub fallback_monitor: String,
     pub log_level: String,
+    /// Default for the "confirm before delete" prompt. The runtime toggle (popover
+    /// checkbox / tray) is persisted separately in `runtime.toml`, which overrides
+    /// this — so Waynote never rewrites the user's config.
+    pub confirm_delete: bool,
     #[serde(flatten)]
     pub extra: BTreeMap<String, toml::Value>,
 }
@@ -42,6 +46,7 @@ impl Default for Config {
             geometry_save_debounce_ms: 500,
             fallback_monitor: "cursor".to_string(),
             log_level: "info".to_string(),
+            confirm_delete: true,
             extra: BTreeMap::new(),
         }
     }
