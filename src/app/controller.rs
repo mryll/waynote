@@ -56,7 +56,7 @@ pub struct Controller {
     /// thread (which reads it for its "Ask before deleting" checkmark). Persisted to
     /// `runtime.toml`; defaults from `config.confirm_delete`.
     pub confirm_delete: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// Whether any notes exist. Shared with the tray thread, which greys out the
+    /// Whether any notes exist. Shared with the tray thread, which omits the
     /// note-dependent menu items (show/hide/send/bring/arrange/move) when empty.
     pub has_notes: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Surface index temporarily lifted to `Overlay` for the duration of a
