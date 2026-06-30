@@ -56,6 +56,9 @@ pub struct Controller {
     /// thread (which reads it for its "Ask before deleting" checkmark). Persisted to
     /// `runtime.toml`; defaults from `config.confirm_delete`.
     pub confirm_delete: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Whether any notes exist. Shared with the tray thread, which greys out the
+    /// note-dependent menu items (show/hide/send/bring/arrange/move) when empty.
+    pub has_notes: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Surface index temporarily lifted to `Overlay` for the duration of a
     /// pointer drag/resize on a Desktop-layer note (restored on gesture end).
     /// `None` when no drag is lifting a surface.
@@ -96,6 +99,7 @@ impl Controller {
             last_monitor: None,
             dragging_note: None,
             confirm_delete,
+            has_notes: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             lifted_surface: None,
             drag_input_surface: None,
             watch_guard: None,
@@ -129,6 +133,9 @@ impl Controller {
         if let Ok(mut ws) = self.watch_state.lock() {
             ws.known = known;
         }
+        // Seed the shared "has notes" flag (the tray reads it; it starts after this).
+        self.has_notes
+            .store(!self.entries.is_empty(), std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
@@ -205,6 +212,8 @@ impl Controller {
             ApplyIntent::Drop(id) => Self::apply_drop(this, &id),
             ApplyIntent::Repath { id, new_path } => Self::apply_repath(this, &id, &new_path),
         }
+        // An external add/remove may have flipped whether any notes exist.
+        Self::refresh_tray_note_state(this);
     }
 
     /// Added or Modified: (re)read the file, then either re-render an existing
@@ -1687,6 +1696,19 @@ impl Controller {
         }
     }
 
+    /// Recompute the shared "has notes" flag and, if it flipped, re-render the tray so
+    /// its note-dependent items grey out / enable. Call after any entry add/remove.
+    fn refresh_tray_note_state(this: &Rc<RefCell<Self>>) {
+        let c = this.borrow();
+        let has = !c.entries.is_empty();
+        let changed = c.has_notes.swap(has, std::sync::atomic::Ordering::Relaxed) != has;
+        if changed {
+            if let Some(h) = &c.tray_handle {
+                h.refresh();
+            }
+        }
+    }
+
     /// Set whether deleting asks for confirmation, update the shared flag (read by
     /// the tray checkmark), and persist it to `runtime.toml` (NOT config.toml).
     pub fn set_confirm_delete(this: &Rc<RefCell<Self>>, value: bool) {
@@ -1735,6 +1757,7 @@ impl Controller {
         }
         Self::remove_known_row(this, id);
         presenter::sync_surface(&mut this.borrow_mut(), surf_idx);
+        Self::refresh_tray_note_state(this);
         Ok(())
     }
 
@@ -2152,11 +2175,12 @@ impl Controller {
 
         install_event_handler_for(this, &id);
         presenter::sync_surface(&mut this.borrow_mut(), surf_idx);
+        Self::refresh_tray_note_state(this);
 
         // New-note UX: drop straight into edit mode + focus. Deferred to idle so
         // the surface is synced/realized first; routed through `on_edit_requested`
         // (NOT enter_edit_and_focus directly) to keep the keyboard-mode sequencing
-        // (commit prior → front-if-Desktop → Exclusive on the final surface → focus).
+        // (commit prior → front-if-Desktop → OnDemand on the final surface → focus).
         let weak = Rc::downgrade(this);
         let edit_id = id.clone();
         glib::idle_add_local_once(move || {

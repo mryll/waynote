@@ -59,6 +59,9 @@ struct WaynoteTray {
     /// Shared with the Controller: the live "confirm before delete" flag, read here
     /// for the "Ask before deleting" checkmark's checked state.
     confirm_delete: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Shared with the Controller: whether any notes exist. Greys out the
+    /// note-dependent menu items when empty.
+    has_notes: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ksni::Tray for WaynoteTray {
@@ -85,39 +88,43 @@ impl ksni::Tray for WaynoteTray {
             }
         };
         // Build a StandardItem with a symbolic icon (icons are best-effort: some SNI
-        // hosts render menu icons, some don't — labels stay self-sufficient).
-        let item = |label: &str, icon: &str, cmd: TrayCommand| -> MenuItem<Self> {
+        // hosts render menu icons, some don't — labels stay self-sufficient). `enabled`
+        // greys out the item (note-dependent actions when there are no notes).
+        let item = |label: &str, icon: &str, cmd: TrayCommand, enabled: bool| -> MenuItem<Self> {
             StandardItem {
                 label: label.into(),
                 icon_name: icon.into(),
+                enabled,
                 activate: Box::new(send(cmd)),
                 ..Default::default()
             }
             .into()
         };
+        // Note-dependent actions are disabled when there are no notes.
+        let has = self.has_notes.load(std::sync::atomic::Ordering::Relaxed);
         // Real separators: clean lines in spec-compliant SNI hosts. Some hosts
         // (Waybar's tray) don't draw them, but the disabled dash-row "fake" looked
         // broken (indented dashes + big gaps) — a clean flat list beats that.
         let sep = || -> MenuItem<Self> { MenuItem::Separator };
 
         let mut items: Vec<MenuItem<Self>> = vec![
-            item("New note", "document-new", TrayCommand::NewNote),
+            item("New note", "document-new", TrayCommand::NewNote, true),
             sep(),
-            item("Show all", "view-reveal-symbolic", TrayCommand::ShowAll),
-            item("Hide all", "view-conceal-symbolic", TrayCommand::HideAll),
+            item("Show all", "view-reveal-symbolic", TrayCommand::ShowAll, has),
+            item("Hide all", "view-conceal-symbolic", TrayCommand::HideAll, has),
             sep(),
-            item("Send all to back", "go-bottom-symbolic", TrayCommand::SendAllToDesktop),
-            item("Bring all to front", "go-top-symbolic", TrayCommand::BringAllToFront),
+            item("Send all to back", "go-bottom-symbolic", TrayCommand::SendAllToDesktop, has),
+            item("Bring all to front", "go-top-symbolic", TrayCommand::BringAllToFront, has),
         ];
 
         // "Send all to monitor →" submenu, one row per monitor. Omitted when there is
-        // only one monitor (nothing to choose).
+        // only one monitor (nothing to choose); disabled when there are no notes.
         if self.monitors.len() > 1 {
             let rows: Vec<MenuItem<Self>> = self
                 .monitors
                 .iter()
                 .map(|(idx, label)| {
-                    item(label, "video-display-symbolic", TrayCommand::MoveAllToMonitor(*idx))
+                    item(label, "video-display-symbolic", TrayCommand::MoveAllToMonitor(*idx), has)
                 })
                 .collect();
             items.push(
@@ -126,6 +133,7 @@ impl ksni::Tray for WaynoteTray {
                     // Waybar's tray) don't draw a submenu arrow, so the label carries it.
                     label: "Send all to monitor   →".into(),
                     icon_name: "video-display-symbolic".into(),
+                    enabled: has,
                     submenu: rows,
                     ..Default::default()
                 }
@@ -134,7 +142,7 @@ impl ksni::Tray for WaynoteTray {
         }
 
         items.push(sep());
-        items.push(item("Arrange", "view-grid-symbolic", TrayCommand::Arrange));
+        items.push(item("Arrange", "view-grid-symbolic", TrayCommand::Arrange, has));
 
         // "Ask before deleting" toggle. A `CheckmarkItem`'s native checkmark isn't
         // drawn by some hosts (Waybar), so the state is shown by the ICON column (like
@@ -163,7 +171,7 @@ impl ksni::Tray for WaynoteTray {
         );
 
         items.push(sep());
-        items.push(item("Quit", "application-exit-symbolic", TrayCommand::Quit));
+        items.push(item("Quit", "application-exit-symbolic", TrayCommand::Quit, true));
         items
     }
 }
@@ -202,11 +210,12 @@ pub fn start_tray(
     // Snapshot the monitors once for the "Send all to monitor" submenu (startup-fixed,
     // matching the rest of the app's monitor model). `(index, label)` is `Send`.
     let monitors = ctrl.borrow().monitor_labels();
-    // Share the confirm-delete flag with the tray (read for the checkmark state).
+    // Share the confirm-delete + has-notes flags with the tray (read in `menu`).
     let confirm_delete = ctrl.borrow().confirm_delete.clone();
+    let has_notes = ctrl.borrow().has_notes.clone();
 
     // Spawn ksni on its own thread. Returns Err if no SNI watcher is available.
-    let tray_item = WaynoteTray { tx, monitors, confirm_delete };
+    let tray_item = WaynoteTray { tx, monitors, confirm_delete, has_notes };
     let handle = match tray_item.spawn() {
         Ok(h) => h,
         Err(e) => {
