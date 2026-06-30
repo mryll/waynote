@@ -88,68 +88,62 @@ impl ksni::Tray for WaynoteTray {
             }
         };
         // Build a StandardItem with a symbolic icon (icons are best-effort: some SNI
-        // hosts render menu icons, some don't — labels stay self-sufficient). `enabled`
-        // greys out the item (note-dependent actions when there are no notes).
-        let item = |label: &str, icon: &str, cmd: TrayCommand, enabled: bool| -> MenuItem<Self> {
+        // hosts render menu icons, some don't — labels stay self-sufficient).
+        let item = |label: &str, icon: &str, cmd: TrayCommand| -> MenuItem<Self> {
             StandardItem {
                 label: label.into(),
                 icon_name: icon.into(),
-                enabled,
                 activate: Box::new(send(cmd)),
                 ..Default::default()
             }
             .into()
         };
-        // Note-dependent actions are disabled when there are no notes.
-        let has = self.has_notes.load(std::sync::atomic::Ordering::Relaxed);
-        // Real separators: clean lines in spec-compliant SNI hosts. Some hosts
-        // (Waybar's tray) don't draw them, but the disabled dash-row "fake" looked
-        // broken (indented dashes + big gaps) — a clean flat list beats that.
         let sep = || -> MenuItem<Self> { MenuItem::Separator };
+        // The note-dependent actions are OMITTED entirely when there are no notes:
+        // Waybar's tray doesn't visually dim disabled items (a greyed item still looks
+        // clickable), and hiding them individually would leave orphan separators — so
+        // the whole block is left out, keeping the menu clean.
+        let has = self.has_notes.load(std::sync::atomic::Ordering::Relaxed);
 
-        let mut items: Vec<MenuItem<Self>> = vec![
-            item("New note", "document-new", TrayCommand::NewNote, true),
-            sep(),
-            item("Show all", "view-reveal-symbolic", TrayCommand::ShowAll, has),
-            item("Hide all", "view-conceal-symbolic", TrayCommand::HideAll, has),
-            sep(),
-            item("Send all to back", "go-bottom-symbolic", TrayCommand::SendAllToDesktop, has),
-            item("Bring all to front", "go-top-symbolic", TrayCommand::BringAllToFront, has),
-        ];
+        let mut items: Vec<MenuItem<Self>> =
+            vec![item("New note", "document-new", TrayCommand::NewNote), sep()];
 
-        // "Send all to monitor →" submenu, one row per monitor. Omitted when there is
-        // only one monitor (nothing to choose); disabled when there are no notes.
-        if self.monitors.len() > 1 {
-            let rows: Vec<MenuItem<Self>> = self
-                .monitors
-                .iter()
-                .map(|(idx, label)| {
-                    item(label, "video-display-symbolic", TrayCommand::MoveAllToMonitor(*idx), has)
-                })
-                .collect();
-            items.push(
-                SubMenu {
-                    // The " →" is a host-independent parent hint: some SNI hosts (e.g.
-                    // Waybar's tray) don't draw a submenu arrow, so the label carries it.
-                    label: "Send all to monitor   →".into(),
-                    icon_name: "video-display-symbolic".into(),
-                    enabled: has,
-                    submenu: rows,
-                    ..Default::default()
-                }
-                .into(),
-            );
+        if has {
+            items.push(item("Show all", "view-reveal-symbolic", TrayCommand::ShowAll));
+            items.push(item("Hide all", "view-conceal-symbolic", TrayCommand::HideAll));
+            items.push(sep());
+            items.push(item("Send all to back", "go-bottom-symbolic", TrayCommand::SendAllToDesktop));
+            items.push(item("Bring all to front", "go-top-symbolic", TrayCommand::BringAllToFront));
+            // "Send all to monitor →" submenu, one row per monitor (only with >1 monitor).
+            if self.monitors.len() > 1 {
+                let rows: Vec<MenuItem<Self>> = self
+                    .monitors
+                    .iter()
+                    .map(|(idx, label)| {
+                        item(label, "video-display-symbolic", TrayCommand::MoveAllToMonitor(*idx))
+                    })
+                    .collect();
+                items.push(
+                    SubMenu {
+                        // " →" is a host-independent parent hint (Waybar draws no arrow).
+                        label: "Send all to monitor   →".into(),
+                        icon_name: "video-display-symbolic".into(),
+                        submenu: rows,
+                        ..Default::default()
+                    }
+                    .into(),
+                );
+            }
+            items.push(sep());
+            items.push(item("Arrange", "view-grid-symbolic", TrayCommand::Arrange));
+            items.push(sep());
         }
-
-        items.push(sep());
-        items.push(item("Arrange", "view-grid-symbolic", TrayCommand::Arrange, has));
 
         // "Ask before deleting" toggle. A `CheckmarkItem`'s native checkmark isn't
         // drawn by some hosts (Waybar), so the state is shown by the ICON column (like
         // every other item, so it stays aligned): a checked vs empty checkbox symbolic.
         // Activation flips the shared flag immediately (so the menu is consistent) and
         // sends it for the GTK thread to persist.
-        items.push(sep());
         let confirm_on = self.confirm_delete.load(std::sync::atomic::Ordering::Relaxed);
         items.push(
             StandardItem {
@@ -171,7 +165,7 @@ impl ksni::Tray for WaynoteTray {
         );
 
         items.push(sep());
-        items.push(item("Quit", "application-exit-symbolic", TrayCommand::Quit, true));
+        items.push(item("Quit", "application-exit-symbolic", TrayCommand::Quit));
         items
     }
 }
