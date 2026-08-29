@@ -30,8 +30,11 @@ rustPlatform.buildRustPackage {
       $out/share/applications/waynote.desktop
     install -Dm644 packaging/waynote.service \
       $out/share/systemd/user/waynote.service
+
+    substituteInPlace $out/share/applications/waynote.desktop \
+      --replace-fail 'Exec=waynote' "Exec=$out/bin/waynote"
     substituteInPlace $out/share/systemd/user/waynote.service \
-      --replace-fail "ExecStart=/usr/bin/waynote" "ExecStart=$out/bin/waynote"
+      --replace-fail 'ExecStart=/usr/bin/waynote' "ExecStart=$out/bin/waynote"
   '';
 
   meta = {

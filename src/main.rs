@@ -249,6 +249,14 @@ fn run_install_user_assets() -> glib::ExitCode {
     let exec_path = std::env::current_exe()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "waynote".to_string());
+    if exec_path.starts_with("/nix/store/") {
+        eprintln!(
+            "warning: `{exec_path}` is a Nix store path; the generated unit would \
+             bypass the GTK wrapper and break after garbage collection.\n\
+             On Nix/NixOS, use the desktop file and user unit shipped by the waynote \
+             package instead of running install-user-assets."
+        );
+    }
     let roots = platform::user_assets::InstallRoots {
         data_home: paths.data_home(),
         config_home: paths.config_home(),
