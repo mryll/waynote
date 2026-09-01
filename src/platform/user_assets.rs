@@ -9,18 +9,7 @@ use super::autostart::unit_file_contents;
 
 /// PURE: the `.desktop` entry contents.
 pub fn desktop_entry_contents() -> String {
-    "\
-[Desktop Entry]\n\
-Type=Application\n\
-Name=Waynote\n\
-Comment=Wayland-native markdown sticky notes\n\
-Exec=waynote\n\
-Icon=waynote\n\
-Categories=Utility;TextEditor;\n\
-Keywords=notes;sticky;markdown;wayland;\n\
-StartupNotify=false\n\
-Terminal=false\n"
-        .to_string()
+    include_str!("../../packaging/waynote.desktop").into()
 }
 
 /// PURE: icon SVG target path under `data_home`.
