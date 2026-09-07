@@ -1260,7 +1260,7 @@ impl render::DragResizeHandler for Controller {
         let surf_idx = presenter::surface_index_for(self, id);
         if let Some(w) = self.views[surf_idx].get(id) {
             self.manager.surfaces()[surf_idx].fixed.move_(w, x as f64, y as f64);
-            // Repaint (commit) per motion. A Background / just-lifted layer-shell
+            // Repaint (commit) per motion. A Bottom / just-lifted layer-shell
             // surface is frame-throttled by the compositor, so without forcing a
             // commit the widget's new position is never displayed — the note
             // visually freezes even though motion events keep flowing. Repaint
@@ -1281,7 +1281,7 @@ impl render::DragResizeHandler for Controller {
         let surf_idx = presenter::surface_index_for(self, id);
         if let Some(widget) = self.views[surf_idx].get(id) {
             widget.set_size_request(w, h);
-            // Same reason as move_live: force a commit so a Background/lifted
+            // Same reason as move_live: force a commit so a Bottom/lifted
             // surface actually displays the new size during the resize gesture.
             crate::platform::repaint::after_content_change(&self.manager.surfaces()[surf_idx]);
         }
@@ -1349,7 +1349,7 @@ impl render::DragResizeHandler for Controller {
         }
         let surf_idx = presenter::surface_index_for(self, id);
         let layer = self.manager.surfaces()[surf_idx].layer;
-        // Desktop (Background) notes additionally get a window-level lift to Overlay
+        // Desktop (Bottom) notes additionally get a window-level lift to Overlay
         // so the dragged note isn't drawn behind windows mid-gesture. We do NOT
         // touch the note's layer / surface_key / views — transient, undone on end.
         if layer == SurfaceLayer::Desktop {
@@ -1358,7 +1358,7 @@ impl render::DragResizeHandler for Controller {
         }
         // For EVERY layer: expand the input region to the WHOLE surface for the drag.
         // A layer-shell surface has no reliable implicit pointer grab — none on a
-        // Background surface, and (observed) none on a Top surface when the active
+        // Bottom surface, and (observed) none on a Top surface when the active
         // workspace isn't the note's origin. Without a grab, motion is GATED by the
         // input region, so the drag "cuts out" the moment the pointer leaves the
         // note's start rect. A full-surface region keeps motion flowing anywhere on
