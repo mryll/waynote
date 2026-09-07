@@ -215,8 +215,10 @@ gapplication action dev.mryll.waynote arrange
 ## How it works
 
 Waynote opens one layer-shell surface per **(monitor × layer)** —
-`front = Layer::Top`, `desktop = Layer::Background` — each hosting a stationary
-canvas. The Wayland input region is limited to the note rectangles, so the rest
+`front = Layer::Top`, `desktop = Layer::Bottom` — each hosting a stationary
+canvas. Desktop notes sit on `Bottom`, not `Background`: wallpaper daemons
+live on `Background`, and the protocol leaves the order within one layer
+undefined, so a wallpaper mapped after Waynote used to hide the notes. The Wayland input region is limited to the note rectangles, so the rest
 of the surface stays click-through. Notes are data models: moving a note across
 monitors or layers recreates its view in the target surface rather than
 reparenting widgets, which avoids ghost frames.

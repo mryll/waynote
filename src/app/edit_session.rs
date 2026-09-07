@@ -5,7 +5,7 @@
 //! used so the note does NOT grab the compositor's keyboard: you can click another
 //! app (or use the note's own header buttons — move-to-monitor, delete) while a note
 //! is open, with no ESC needed. Editing a `Desktop`-layer note is unreliable
-//! (Background keyboard focus is compositor-impl-defined), so the note is temporarily
+//! (Bottom keyboard focus is compositor-impl-defined), so the note is temporarily
 //! fronted for the edit session — the editing surface is always a Top/Overlay one.
 //!
 //! KNOWN LIMITATION: on Wayland an app can't force keyboard focus onto a layer-shell
@@ -46,7 +46,7 @@ fn mode_for(idx: usize, editing_surf: Option<usize>) -> KeyMode {
 
 /// PURE: whether editing a note on `layer` requires temporarily fronting it.
 ///
-/// `Desktop` (Background) layer: keyboard focus there is compositor-impl-defined
+/// `Desktop` (Bottom) layer: keyboard focus there is compositor-impl-defined
 /// → return `true` so the Controller temporarily moves the note to the Front
 /// surface while editing. `Front` (Top) layer: keyboard focus works reliably →
 /// return `false`.

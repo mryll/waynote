@@ -14,7 +14,11 @@ impl SurfaceLayer {
     fn to_layer(self) -> Layer {
         match self {
             SurfaceLayer::Front => Layer::Top,
-            SurfaceLayer::Desktop => Layer::Background,
+            // Bottom, not Background: wallpaper daemons (swaybg, hyprpaper, the
+            // Omarchy shell) live on Background, and the protocol leaves the order
+            // within one layer undefined — a wallpaper mapped after Waynote hid
+            // the notes. Bottom sits above every wallpaper and below windows.
+            SurfaceLayer::Desktop => Layer::Bottom,
         }
     }
 }
