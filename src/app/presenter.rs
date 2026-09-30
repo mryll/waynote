@@ -167,7 +167,7 @@ fn add_present_repaint(ctrl: &mut Controller, surf_idx: usize) {
     let rects: Vec<Rect> = want.iter().map(|(_, r, _)| *r).collect();
     let region = input_region::build(&rects);
     let surf = &ctrl.manager.surfaces()[surf_idx];
-    input_region::apply(&surf.window, &region);
+    input_region::apply(surf, &region);
     repaint::after_content_change(surf);
 }
 

@@ -360,15 +360,14 @@ impl Controller {
     /// the save; the NoteView only emitted. Runs on the GTK thread, called from an
     /// idle tick (see `install_event_handlers`) so no NoteView borrow is held.
     ///
-    /// `PasteImageRequested` is intercepted in the idle handler closure (which
-    /// holds the `Rc`) and dispatched to `Controller::paste_image` directly.
+    /// Image paste and colour changes are dispatched through the handler closure,
+    /// which holds the `Rc` needed for those actions.
     pub fn handle_event(&mut self, id: &NoteId, ev: NoteEvent) {
         match ev {
             NoteEvent::EditRequested => self.on_edit_requested(id),
             NoteEvent::EditCommitted(raw) => self.on_edit_committed(id, raw),
             NoteEvent::TaskToggled(idx) => self.on_task_toggled(id, idx),
-            NoteEvent::ColorRequested(color) => self.on_color_requested(id, color),
-            NoteEvent::PasteImageRequested => {} // handled via paste_image in the idle closure
+            NoteEvent::ColorRequested(_) | NoteEvent::PasteImageRequested => {}
             NoteEvent::CollapseToggled => self.on_collapse_toggled(id),
         }
     }
@@ -559,24 +558,6 @@ impl Controller {
         self.after_persist(id, outcome);
     }
 
-    /// Set the note colour, persist, and recolour the chrome + re-render content.
-    fn on_color_requested(&mut self, id: &NoteId, color: String) {
-        // Validate even though the picker only offers valid colours — NoteEvent is
-        // an internal boundary (same guard as `set_color`).
-        if !crate::core::theme::is_note_color(&color) {
-            return;
-        }
-        let Some(entry) = self.entries.get_mut(id) else { return };
-        let old = entry.note.color.clone();
-        if old == color {
-            return;
-        }
-        entry.note.color = color.clone();
-        let outcome = persist_entry(entry, now_ts());
-        entry.chrome.set_color(&old, &color);
-        self.after_persist(id, outcome);
-    }
-
     /// React to a persist outcome: update watcher state and toggle the per-note
     /// conflict indicator on the chrome.
     fn after_persist(&mut self, id: &NoteId, outcome: PersistOutcome) {
@@ -632,6 +613,14 @@ impl Controller {
     }
 }
 
+fn dispatch_note_event(ctrl: &Rc<RefCell<Controller>>, id: &NoteId, ev: NoteEvent) {
+    match ev {
+        NoteEvent::PasteImageRequested => Controller::paste_image(ctrl, id),
+        NoteEvent::ColorRequested(color) => Controller::set_color(ctrl, id, &color),
+        other => ctrl.borrow_mut().handle_event(id, other),
+    }
+}
+
 /// Install the single event handler on every entry's `NoteView`. Each handler
 /// captures `Weak<RefCell<Controller>>` (NEVER a strong `Rc` — that reintroduces
 /// the Rc cycle we already fixed) plus the `NoteId`. The emit is deferred to a
@@ -649,11 +638,7 @@ fn install_event_handlers(this: &Rc<RefCell<Controller>>) {
             let (weak, id) = (weak_handler.clone(), id_handler.clone());
             glib::idle_add_local_once(move || {
                 let Some(ctrl) = weak.upgrade() else { return };
-                if matches!(ev, NoteEvent::PasteImageRequested) {
-                    Controller::paste_image(&ctrl, &id);
-                } else {
-                    ctrl.borrow_mut().handle_event(&id, ev);
-                }
+                dispatch_note_event(&ctrl, &id, ev);
             });
         });
         render::NoteView::set_event_handler(&entry.chrome.note_view, handler);
@@ -923,11 +908,7 @@ fn install_event_handler_for(this: &Rc<RefCell<Controller>>, id: &NoteId) {
         let (weak, id) = (weak_handler.clone(), id_handler.clone());
         glib::idle_add_local_once(move || {
             let Some(ctrl) = weak.upgrade() else { return };
-            if matches!(ev, NoteEvent::PasteImageRequested) {
-                Controller::paste_image(&ctrl, &id);
-            } else {
-                ctrl.borrow_mut().handle_event(&id, ev);
-            }
+            dispatch_note_event(&ctrl, &id, ev);
         });
     });
     render::NoteView::set_event_handler(&entry.chrome.note_view, handler);
@@ -1372,7 +1353,7 @@ impl render::DragResizeHandler for Controller {
         // surface would keep swallowing the whole monitor's clicks after the drag).
         let full = surface_bounds(self, surf_idx);
         let region = crate::platform::input_region::build(&[full]);
-        crate::platform::input_region::apply(&self.manager.surfaces()[surf_idx].window, &region);
+        crate::platform::input_region::apply(&self.manager.surfaces()[surf_idx], &region);
         self.drag_input_surface = Some(surf_idx);
     }
 
@@ -1502,15 +1483,18 @@ pub fn relayer_ids<'a>(
 /// If note `id` is being edited, commit that edit (the real persist is deferred to
 /// idle by the NoteView sink) and schedule `f` on a LATER idle so it runs AFTER the
 /// edit persists; return `true`. Otherwise return `false` and the caller runs `f`
-/// synchronously. Frontmatter-only toggles (pin/lock) must use this: persisting the
+/// synchronously. Frontmatter-only changes (pin/lock/colour) must use this: persisting the
 /// toggle BEFORE the queued edit commit makes that commit see an external disk
 /// change and write a spurious conflict copy. Idle callbacks run FIFO, so `f` (queued
 /// after the edit-commit idle) is guaranteed to run last.
-fn defer_after_edit_commit(
+fn defer_after_edit_commit<F>(
     this: &Rc<RefCell<Controller>>,
     id: &NoteId,
-    f: fn(&Rc<RefCell<Controller>>, &NoteId),
-) -> bool {
+    f: F,
+) -> bool
+where
+    F: FnOnce(&Rc<RefCell<Controller>>, &NoteId) + 'static,
+{
     // `edit_base_hash.is_some()` means an edit save is in flight for THIS note: either
     // it is actively being edited, OR a prior action already triggered the commit but the
     // deferred `on_edit_committed` idle has not persisted yet (which also clears
@@ -1763,6 +1747,16 @@ impl Controller {
             eprintln!("[waynote] set_color: unknown color {color:?} — keeping current");
             return;
         }
+        let pending_color = color.to_string();
+        if defer_after_edit_commit(this, id, move |ctrl, id| {
+            Self::apply_set_color(ctrl, id, &pending_color);
+        }) {
+            return;
+        }
+        Self::apply_set_color(this, id, color);
+    }
+
+    fn apply_set_color(this: &Rc<RefCell<Self>>, id: &NoteId, color: &str) {
         let (outcome, old_color) = {
             let mut c = this.borrow_mut();
             let Some(entry) = c.entries.get_mut(id) else { return };
@@ -2857,3 +2851,7 @@ mod tests {
         assert_eq!(ids, vec!["01AAA", "01MMM", "01ZZZ"]);
     }
 }
+
+#[cfg(test)]
+#[path = "controller_gui_tests.rs"]
+mod gui_tests;
