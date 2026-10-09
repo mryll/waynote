@@ -1027,6 +1027,7 @@ fn make_entry(
         conflict: false,
         pending_layout_save: None,
         temporarily_fronted: false,
+        pending_color: None,
     }
 }
 
@@ -1487,14 +1488,11 @@ pub fn relayer_ids<'a>(
 /// toggle BEFORE the queued edit commit makes that commit see an external disk
 /// change and write a spurious conflict copy. Idle callbacks run FIFO, so `f` (queued
 /// after the edit-commit idle) is guaranteed to run last.
-fn defer_after_edit_commit<F>(
+fn defer_after_edit_commit(
     this: &Rc<RefCell<Controller>>,
     id: &NoteId,
-    f: F,
-) -> bool
-where
-    F: FnOnce(&Rc<RefCell<Controller>>, &NoteId) + 'static,
-{
+    f: fn(&Rc<RefCell<Controller>>, &NoteId),
+) -> bool {
     // `edit_base_hash.is_some()` means an edit save is in flight for THIS note: either
     // it is actively being edited, OR a prior action already triggered the commit but the
     // deferred `on_edit_committed` idle has not persisted yet (which also clears
@@ -1747,13 +1745,31 @@ impl Controller {
             eprintln!("[waynote] set_color: unknown color {color:?} — keeping current");
             return;
         }
-        let pending_color = color.to_string();
-        if defer_after_edit_commit(this, id, move |ctrl, id| {
-            Self::apply_set_color(ctrl, id, &pending_color);
-        }) {
+        // Serialise requests per note through `pending_color`: a deferred apply
+        // takes whatever was requested LAST, and an immediate apply clears it, so
+        // a deferred callback that fires after a newer immediate change (e.g. a
+        // D-Bus `set-color` landing between two idle batches) finds nothing to do
+        // instead of overwriting that newer selection.
+        {
+            let mut c = this.borrow_mut();
+            let Some(entry) = c.entries.get_mut(id) else { return };
+            entry.pending_color = Some(color.to_string());
+        }
+        if defer_after_edit_commit(this, id, Self::apply_pending_color) {
             return;
         }
-        Self::apply_set_color(this, id, color);
+        Self::apply_pending_color(this, id);
+    }
+
+    fn apply_pending_color(this: &Rc<RefCell<Self>>, id: &NoteId) {
+        let pending = this
+            .borrow_mut()
+            .entries
+            .get_mut(id)
+            .and_then(|entry| entry.pending_color.take());
+        if let Some(color) = pending {
+            Self::apply_set_color(this, id, &color);
+        }
     }
 
     fn apply_set_color(this: &Rc<RefCell<Self>>, id: &NoteId, color: &str) {
@@ -2262,6 +2278,7 @@ impl Controller {
                 conflict: false,
                 pending_layout_save: None,
                 temporarily_fronted: false,
+                pending_color: None,
             };
             c.entries.insert(id.clone(), entry);
 

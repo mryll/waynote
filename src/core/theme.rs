@@ -41,7 +41,7 @@ const ORANGE: Theme = Theme {
 };
 
 /// The note colour palette, in picker order. Single source of truth for the valid
-/// colour set (used by the picker UI, `set_color`, and `on_color_requested`).
+/// colour set (used by the picker UI and `set_color`).
 pub const NOTE_COLORS: [&str; 7] =
     ["yellow", "green", "blue", "pink", "purple", "gray", "orange"];
 

@@ -228,7 +228,9 @@ fn gui_regressions() {
     check_surface_remapping(&ctrl, &id);
     check_external_conflict(&ctrl, &id);
 
-    for surf in ctrl.borrow().manager.surfaces() {
-        surf.window.destroy();
-    }
+    // No explicit `window.destroy()`: on GTK 4.22 + gtk4-layer-shell 1.3 it
+    // segfaults inside gtk_window_destroy's signal emission after the checks
+    // have passed (seen on Hyprland 0.56.2), which turns a green run into a
+    // SIGSEGV exit. The app never destroys a layer window either; the process
+    // ending reclaims the surfaces.
 }
