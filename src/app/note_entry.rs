@@ -70,4 +70,8 @@ pub struct NoteEntry {
     /// `restore_layer_if_needed` when the edit session ends.
     // used in Plan 5 Task 8 (keyboard edit session)
     pub temporarily_fronted: bool,
+    /// The colour requested last while a change is still deferred behind an edit
+    /// commit (`set_color`). Every request overwrites it and every apply takes
+    /// it, so a stale deferred apply can never overwrite a newer selection.
+    pub pending_color: Option<String>,
 }

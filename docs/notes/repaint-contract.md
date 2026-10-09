@@ -46,12 +46,13 @@ verified to clear the empty-surface case identically.
 
 ### Map-time input-region hardening
 
-Each surface connects `map` and applies an **empty input region immediately** on
-first map, before any note rects are added. A freshly-mapped layer surface
+Each surface retains its latest requested input region and reapplies it on `map`.
+The initial region is empty, before any note rects are added. A freshly-mapped layer surface
 otherwise has an infinite (whole-surface) input region until the per-note region
-is applied, which would briefly capture the entire desktop. The empty-on-map
+is applied, which would briefly capture the entire desktop. The initially empty
 region closes that transient leak; note rects are added later by
-`input_region::apply`.
+`input_region::apply`, even if the surface is not realized yet. Subsequent maps
+restore the saved region so visible notes remain clickable.
 
 ## Candidate ladder — what was tried and what happened
 
@@ -144,3 +145,30 @@ Desktop layer, behind windows). Input-region correctness is by construction.
 **Status: EXECUTED end-to-end and PASSED on Hyprland 0.55.2 (2026-06-24) AND
 Sway 1.11 (nested, 2026-06-25)** with the opacity-fill mechanism. Both reference
 wlr-layer-shell compositors pass; no compositor-specific workaround needed.
+
+
+## Input region and edit regression checks
+
+On a Wayland session with layer-shell support, run:
+
+```bash
+python3 scripts/gui-regressions.py
+```
+
+The runner creates a separate GTK application and uses temporary directories for
+notes, configuration, and layout. It checks that picker and remote color changes
+preserve an active edit, rapid color changes preserve the latest selection, and
+selecting the current color still saves the edit. A genuine external change must
+leave the original file intact and preserve the local edit in a conflict copy.
+
+The surface check updates the input region before realization, maps the window,
+then changes the region while the window is unrealized and maps it again. It also
+remaps an empty surface. The runner checks the actual Wayland `set_input_region`
+requests against the expected rectangles, since GDK has no public getter for the
+region sent to the compositor.
+
+The GTK test is ignored by the default test run because it needs a compositor.
+Run `cargo test --offline` for the default suite. The GUI checks passed on niri
+with GTK 4.20.4 on 2026-09-30. Removing either the color deferral or the retained
+map region makes the corresponding GUI check fail. These checks cover the two
+specific bugs; they do not establish the cause of every reported freeze.

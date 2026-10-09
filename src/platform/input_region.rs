@@ -1,6 +1,6 @@
 use gtk::prelude::*;
 use gtk::gdk::prelude::SurfaceExt;
-use gtk::ApplicationWindow;
+use super::surfaces::Surf;
 use super::geometry::Rect;
 
 pub fn build(rects: &[Rect]) -> gtk::cairo::Region {
@@ -11,8 +11,10 @@ pub fn build(rects: &[Rect]) -> gtk::cairo::Region {
     region
 }
 
-pub fn apply(window: &ApplicationWindow, region: &gtk::cairo::Region) {
-    if let Some(surface) = window.surface() {
+/// Store the region before applying it so the next map restores the same input.
+pub fn apply(surf: &Surf, region: &gtk::cairo::Region) {
+    *surf.input_region.borrow_mut() = region.clone();
+    if let Some(surface) = surf.window.surface() {
         surface.set_input_region(Some(region));
     }
 }

@@ -1,3 +1,6 @@
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use gtk::prelude::*;
 use gtk::gdk::prelude::SurfaceExt;
 use gtk::{Application, ApplicationWindow, Fixed, gdk};
@@ -28,6 +31,8 @@ pub struct Surf {
     pub layer: SurfaceLayer,
     pub window: ApplicationWindow,
     pub fixed: Fixed,
+    /// Latest requested region, retained even while the window is unrealized.
+    pub input_region: Rc<RefCell<gtk::cairo::Region>>,
 }
 
 pub struct SurfaceManager {
@@ -54,15 +59,14 @@ impl SurfaceManager {
                 }
                 let fixed = Fixed::new();
                 window.set_child(Some(&fixed));
-                // Close the map-time input-region leak: a freshly mapped layer
-                // surface has an infinite (whole-surface) input region until the
-                // per-note region is applied, which would briefly capture the
-                // entire desktop. Apply an empty region on map so the surface is
-                // fully click-through from its first frame; note rects are added
-                // later by `input_region::apply`.
-                window.connect_map(|w| {
+                // Keep the latest region across unmap/remap and surface recreation.
+                // An empty initial region makes startup click-through; subsequent
+                // maps must restore the notes rather than clear their input.
+                let input_region = Rc::new(RefCell::new(gtk::cairo::Region::create()));
+                let mapped_region = input_region.clone();
+                window.connect_map(move |w| {
                     if let Some(surface) = w.surface() {
-                        surface.set_input_region(Some(&gtk::cairo::Region::create()));
+                        surface.set_input_region(Some(&mapped_region.borrow()));
                     }
                 });
                 surfaces.push(Surf {
@@ -70,6 +74,7 @@ impl SurfaceManager {
                     layer,
                     window,
                     fixed,
+                    input_region,
                 });
             }
         }
