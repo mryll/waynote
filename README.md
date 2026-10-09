@@ -22,7 +22,7 @@ friendly to Obsidian and AI agents: edit a note from any editor and it refreshes
 live on screen.
 
 > [!NOTE]
-> **Waynote is v0.1.6 — young, but functional.** The full feature set works, and
+> **Waynote is v0.1.6 — in development.** The planned feature set works, and
 > the interactive paths (drag/resize, click-to-edit, roll-up, checkboxes, image
 > paste, tray) are exercised on real desktops — but still expect the occasional
 > rough edge. [Issues](https://github.com/mryll/waynote/issues) and feedback are
@@ -248,7 +248,7 @@ keeping domain logic unit-testable without a display.
 
 ## Status
 
-Waynote 0.1.6 is feature-complete: notes on the Wayland desktop with faithful
+Waynote 0.1.6 is in development. What works today: notes on the Wayland desktop with faithful
 markdown rendering, persistence with live file-watching and conflict copies,
 per-note colour / lock / layer / pin / move-to-monitor controls, roll-up to the
 header bar, a system-tray item, image paste, and autostart.
