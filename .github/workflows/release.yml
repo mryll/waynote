@@ -23,7 +23,21 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-4-dev libgtk4-layer-shell-dev pkg-config
+          sudo apt-get install -y libgtk-4-dev pkg-config meson ninja-build \
+            libwayland-dev wayland-protocols
+
+      # Ubuntu 24.04 ships no libgtk4-layer-shell-dev; build the library from
+      # source, pinned to the v1.3.0 tag by commit so the input cannot move.
+      - name: Build gtk4-layer-shell
+        run: |
+          git clone https://github.com/wmww/gtk4-layer-shell.git
+          cd gtk4-layer-shell
+          git checkout 1c963c51514581c41b9bdae08cdf69171265cdda
+          meson setup build -Dexamples=false -Ddocs=false -Dtests=false \
+            -Dsmoke-tests=false -Dintrospection=false -Dvapi=false
+          ninja -C build
+          sudo ninja -C build install
+          sudo ldconfig
 
       - uses: dtolnay/rust-toolchain@stable
 
