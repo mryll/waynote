@@ -1,0 +1,48 @@
+name: Release
+
+# A tag push builds the binary and publishes the GitHub release the AUR
+# waynote-bin package downloads. The manual trigger only builds, to check
+# the runner before cutting a tag.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    # ubuntu-24.04 pins glibc 2.39, the floor the published binaries have
+    # required since 0.1.5; `ubuntu-latest` would raise it silently.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev libgtk4-layer-shell-dev pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Prepare binary
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          cp target/release/waynote "waynote-${VERSION}-x86_64-linux"
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+          objdump -T "waynote-${VERSION}-x86_64-linux" | grep -o 'GLIBC_[0-9.]*' | sort -V | uniq | tail -1
+
+      - name: Create release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release create "$GITHUB_REF_NAME"
+          "waynote-${VERSION}-x86_64-linux"
+          --title "$GITHUB_REF_NAME"
+          --generate-notes
