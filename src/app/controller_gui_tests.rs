@@ -116,6 +116,45 @@ fn check_external_conflict(ctrl: &Rc<RefCell<Controller>>, id: &NoteId) {
         .any(|note| note.body == "# Local edit\nKeep this in a conflict copy.\n"));
 }
 
+fn check_layer_change_during_edit(ctrl: &Rc<RefCell<Controller>>, id: &NoteId) {
+    let conflict_copies = |c: &Controller| {
+        std::fs::read_dir(c.paths.notes_dir())
+            .unwrap()
+            .filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().contains(".conflict-"))
+            .count()
+    };
+    let before = conflict_copies(&ctrl.borrow());
+    let body = "# Layer edit\nKeep this body.\n";
+    for layer in [Layer::Desktop, Layer::Front] {
+        replace_editor_text(ctrl, id, body);
+        Controller::set_layer_durable(ctrl, id, layer.clone());
+        wait_until(|| ctrl.borrow().entries[id].edit_base_hash.is_none());
+        let c = ctrl.borrow();
+        let disk = frontmatter::parse(&std::fs::read_to_string(&c.entries[id].path).unwrap());
+        assert_eq!(disk.body, body);
+        assert_eq!(disk.layer, layer, "layer change was not saved");
+        assert_eq!(conflict_copies(&c), before, "layer change created a false conflict");
+    }
+
+    // The header button flips the DURABLE layer. A Desktop note being edited is only
+    // transiently Front, so clicking there means "bring to front".
+    for (start, end) in [(Layer::Desktop, Layer::Front), (Layer::Front, Layer::Desktop)] {
+        Controller::set_layer_durable(ctrl, id, start);
+        replace_editor_text(ctrl, id, body);
+        let button = ctrl.borrow().entries[id].chrome.layer_button.clone();
+        button.emit_clicked();
+        wait_until(|| {
+            let c = ctrl.borrow();
+            let entry = &c.entries[id];
+            entry.edit_base_hash.is_none() && !entry.temporarily_fronted && entry.note.layer == end
+        });
+        let c = ctrl.borrow();
+        let disk = frontmatter::parse(&std::fs::read_to_string(&c.entries[id].path).unwrap());
+        assert_eq!(disk.layer, end, "button did not flip the durable layer");
+        assert_eq!(conflict_copies(&c), before, "button click created a false conflict");
+    }
+}
+
 fn map_and_wait(window: &gtk::ApplicationWindow, expected: Option<gtk::cairo::RectangleInt>) {
     // The companion script checks these markers against Wayland requests, since
     // GDK exposes no getter for the input region actually sent to the compositor.
@@ -225,6 +264,7 @@ fn gui_regressions() {
     presenter::sync_all(&mut ctrl.borrow_mut());
 
     check_color_changes(&app, &ctrl, &id);
+    check_layer_change_during_edit(&ctrl, &id);
     check_surface_remapping(&ctrl, &id);
     check_external_conflict(&ctrl, &id);
 

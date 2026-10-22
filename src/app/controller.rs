@@ -667,7 +667,11 @@ fn wire_layer_button(
         let (weak, id) = (weak.clone(), id.clone());
         glib::idle_add_local_once(move || {
             let Some(ctrl) = weak.upgrade() else { return };
-            let current = ctrl.borrow().entries.get(&id).map(|e| e.note.layer.clone());
+            // `note.layer` reads Front while a Desktop note is only fronted for editing;
+            // flip the durable layer, as `persist_entry` saves it.
+            let current = ctrl.borrow().entries.get(&id).map(|e| {
+                if e.temporarily_fronted { Layer::Desktop } else { e.note.layer.clone() }
+            });
             match current {
                 Some(Layer::Front) => Controller::send_to_desktop(&ctrl, &id),
                 Some(Layer::Desktop) => Controller::bring_to_front(&ctrl, &id),
@@ -1028,6 +1032,7 @@ fn make_entry(
         pending_layout_save: None,
         temporarily_fronted: false,
         pending_color: None,
+        pending_layer: None,
     }
 }
 
@@ -1874,6 +1879,24 @@ impl Controller {
 
     /// Internal: flip a note's layer, persist, and re-sync both surfaces.
     fn set_layer_durable(this: &Rc<RefCell<Self>>, id: &NoteId, new_layer: Layer) {
+        {
+            let mut c = this.borrow_mut();
+            let Some(entry) = c.entries.get_mut(id) else { return };
+            entry.pending_layer = Some(new_layer);
+        }
+        if defer_after_edit_commit(this, id, Self::apply_pending_layer) {
+            return;
+        }
+        Self::apply_pending_layer(this, id);
+    }
+
+    fn apply_pending_layer(this: &Rc<RefCell<Self>>, id: &NoteId) {
+        let pending = this
+            .borrow_mut()
+            .entries
+            .get_mut(id)
+            .and_then(|entry| entry.pending_layer.take());
+        let Some(new_layer) = pending else { return };
         // Pinned notes are anchored (durable layer frozen); same-layer transitions are
         // no-ops. The UI disables the ▲/▼ button when pinned, but the D-Bus
         // send-to-desktop / bring-to-front actions can still reach here — guard both.
@@ -2279,6 +2302,7 @@ impl Controller {
                 pending_layout_save: None,
                 temporarily_fronted: false,
                 pending_color: None,
+                pending_layer: None,
             };
             c.entries.insert(id.clone(), entry);
 
