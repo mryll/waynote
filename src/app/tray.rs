@@ -1,5 +1,6 @@
 //! StatusNotifierItem tray via `ksni`. ksni runs its OWN thread (blocking API);
-//! menu clicks send a `Send` `TrayCommand` over an mpsc channel that a
+//! menu clicks and the icon's activation (SNI `Activate` — a left click on most
+//! hosts) send a `Send` `TrayCommand` over an mpsc channel that a
 //! `glib::timeout_add_local` drain on the GTK main thread maps to GApplication
 //! actions / `app.quit()` — the SAME cross-thread bridge as
 //! `Controller::start_watcher` (controller.rs).
@@ -22,7 +23,8 @@ pub enum TrayCommand {
     NewNote,
     ShowAll,
     HideAll,
-    /// Left click: show all if any note is hidden, else hide all.
+    /// Icon activation (SNI `Activate`, usually a left click): show all if any
+    /// note is hidden, else hide all.
     Toggle,
     SendAllToDesktop,
     BringAllToFront,
@@ -266,8 +268,22 @@ mod tests {
     }
 
     #[test]
-    fn action_name_toggle() {
+    fn toggle_maps_to_action() {
         assert_eq!(action_name(TrayCommand::Toggle), Some("toggle"));
+    }
+
+    #[test]
+    fn activating_the_icon_sends_one_toggle() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut tray = WaynoteTray {
+            tx,
+            monitors: Vec::new(),
+            confirm_delete: Default::default(),
+            has_notes: Default::default(),
+        };
+        ksni::Tray::activate(&mut tray, 0, 0);
+        assert_eq!(rx.try_recv(), Ok(TrayCommand::Toggle));
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
