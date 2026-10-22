@@ -19,8 +19,8 @@ fn wait_until(done: impl Fn() -> bool) {
     }
 }
 
-fn replace_editor_text(ctrl: &Rc<RefCell<Controller>>, id: &NoteId, text: &str) {
-    ctrl.borrow_mut().on_edit_requested(id);
+/// The note's view/edit stack and its raw-markdown editor.
+fn edit_page(ctrl: &Rc<RefCell<Controller>>, id: &NoteId) -> (gtk::Stack, gtk::TextView) {
     let widget = ctrl.borrow().entries[id]
         .chrome
         .note_view
@@ -42,7 +42,19 @@ fn replace_editor_text(ctrl: &Rc<RefCell<Controller>>, id: &NoteId, text: &str) 
         .unwrap()
         .downcast::<gtk::TextView>()
         .unwrap();
-    editor.buffer().set_text(text);
+    (stack, editor)
+}
+
+fn replace_editor_text(ctrl: &Rc<RefCell<Controller>>, id: &NoteId, text: &str) {
+    ctrl.borrow_mut().on_edit_requested(id);
+    edit_page(ctrl, id).1.buffer().set_text(text);
+}
+
+fn assert_still_editing(ctrl: &Rc<RefCell<Controller>>, id: &NoteId, text: &str) {
+    let (stack, editor) = edit_page(ctrl, id);
+    assert_eq!(stack.visible_child_name().as_deref(), Some("edit"), "the edit was closed");
+    let buffer = editor.buffer();
+    assert_eq!(buffer.text(&buffer.start_iter(), &buffer.end_iter(), false), text);
 }
 
 fn assert_saved(ctrl: &Rc<RefCell<Controller>>, id: &NoteId, body: &str, color: &str) {
@@ -104,16 +116,97 @@ fn check_external_conflict(ctrl: &Rc<RefCell<Controller>>, id: &NoteId) {
     });
     assert_eq!(std::fs::read_to_string(&path).unwrap(), external_bytes);
     assert!(ctrl.borrow().entries[id].conflict);
+    assert!(conflict_copy_bodies(ctrl)
+        .iter()
+        .any(|body| body == "# Local edit\nKeep this in a conflict copy.\n"));
+}
+
+/// The body of every conflict copy in the notes dir.
+fn conflict_copy_bodies(ctrl: &Rc<RefCell<Controller>>) -> Vec<String> {
     let notes_dir = ctrl.borrow().paths.notes_dir();
-    let copies: Vec<_> = std::fs::read_dir(notes_dir)
+    std::fs::read_dir(notes_dir)
         .unwrap()
         .map(|entry| entry.unwrap().path())
-        .filter(|candidate| candidate != &path)
-        .map(|candidate| frontmatter::parse(&std::fs::read_to_string(candidate).unwrap()))
-        .collect();
-    assert!(copies
-        .iter()
-        .any(|note| note.body == "# Local edit\nKeep this in a conflict copy.\n"));
+        .filter(|candidate| candidate.file_name().unwrap().to_string_lossy().contains(".conflict-"))
+        .map(|candidate| frontmatter::parse(&std::fs::read_to_string(candidate).unwrap()).body)
+        .collect()
+}
+
+/// Syncthing, an editor or an agent writes the note while it is open in the editor.
+/// The watcher's reload must leave the editor alone; the save then keeps both texts.
+fn check_outside_change_during_edit(ctrl: &Rc<RefCell<Controller>>, id: &NoteId) {
+    let typed = "# Typed during a sync\nKeep this in a conflict copy.\n";
+    replace_editor_text(ctrl, id, typed);
+    let path = ctrl.borrow().entries[id].path.clone();
+    let mut outside = frontmatter::parse(&std::fs::read_to_string(&path).unwrap());
+    outside.body = "# Synced from elsewhere\nKeep this in the note.\n".into();
+    let outside_bytes = frontmatter::serialize(&outside);
+    std::fs::write(&path, &outside_bytes).unwrap();
+    // What the watcher's drain runs once a scan sees the new hash.
+    Controller::apply_change(ctrl, Change::Modified(id.clone()));
+    assert_still_editing(ctrl, id, typed);
+
+    ctrl.borrow_mut().commit_current_editor(id);
+    wait_until(|| ctrl.borrow().entries[id].edit_base_hash.is_none());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), outside_bytes);
+    assert!(ctrl.borrow().entries[id].conflict);
+    assert!(conflict_copy_bodies(ctrl).iter().any(|body| body == typed));
+
+    // The conflict copy's write wakes the watcher, which reports the change again.
+    Controller::apply_change(ctrl, Change::Modified(id.clone()));
+    assert_eq!(ctrl.borrow().entries[id].note.body, outside.body);
+}
+
+/// The same outside change while the note is open but nothing was typed. There is no
+/// text of the user's to keep, so no conflict copy: the change simply lands.
+fn check_outside_change_during_untouched_edit(ctrl: &Rc<RefCell<Controller>>, id: &NoteId) {
+    let copies = conflict_copy_bodies(ctrl).len();
+    ctrl.borrow_mut().on_edit_requested(id);
+    let path = ctrl.borrow().entries[id].path.clone();
+    let mut outside = frontmatter::parse(&std::fs::read_to_string(&path).unwrap());
+    outside.body = "# Synced while open\nNothing was typed.\n".into();
+    let outside_bytes = frontmatter::serialize(&outside);
+    std::fs::write(&path, &outside_bytes).unwrap();
+    Controller::apply_change(ctrl, Change::Modified(id.clone()));
+
+    ctrl.borrow_mut().commit_current_editor(id);
+    wait_until(|| ctrl.borrow().entries[id].edit_base_hash.is_none());
+    assert_eq!(conflict_copy_bodies(ctrl).len(), copies, "an untouched edit wrote a conflict copy");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), outside_bytes);
+    let c = ctrl.borrow();
+    assert_eq!(c.entries[id].path, path);
+    assert_eq!(c.entries[id].note.body, outside.body);
+    assert!(!c.entries[id].conflict);
+}
+
+/// The note's file is deleted while it is open in the editor. The note must stay,
+/// and the save writes the typed text back to the same file.
+fn check_outside_delete_during_edit(ctrl: &Rc<RefCell<Controller>>, id: &NoteId) {
+    let typed = "# Typed while deleted\nSave this note again.\n";
+    replace_editor_text(ctrl, id, typed);
+    let path = ctrl.borrow().entries[id].path.clone();
+    std::fs::remove_file(&path).unwrap();
+    Controller::apply_change(ctrl, Change::Removed(id.clone()));
+    assert!(ctrl.borrow().entries.contains_key(id), "the note was dropped");
+    assert_still_editing(ctrl, id, typed);
+
+    ctrl.borrow_mut().commit_current_editor(id);
+    wait_until(|| ctrl.borrow().entries[id].edit_base_hash.is_none());
+    let disk = frontmatter::parse(&std::fs::read_to_string(&path).unwrap());
+    assert_eq!(disk.body, typed);
+    assert!(!ctrl.borrow().entries[id].conflict);
+
+    // Again with ESC already pressed: the edit session is over, but its save still
+    // waits on an idle tick, so dropping the note now would lose the typed text.
+    let typed = "# Typed before the delete\nSave this after it.\n";
+    replace_editor_text(ctrl, id, typed);
+    ctrl.borrow_mut().commit_current_editor(id);
+    std::fs::remove_file(&path).unwrap();
+    Controller::apply_change(ctrl, Change::Removed(id.clone()));
+    assert!(ctrl.borrow().entries.contains_key(id), "the note was dropped before its save");
+    wait_until(|| ctrl.borrow().entries[id].edit_base_hash.is_none());
+    let disk = frontmatter::parse(&std::fs::read_to_string(&path).unwrap());
+    assert_eq!(disk.body, typed);
 }
 
 fn check_layer_change_during_edit(ctrl: &Rc<RefCell<Controller>>, id: &NoteId) {
@@ -275,6 +368,11 @@ fn gui_regressions() {
     check_color_changes(&app, &ctrl, &id);
     check_layer_change_during_edit(&ctrl, &id);
     check_surface_remapping(&ctrl, &id);
+    // Before `check_external_conflict`: its conflict leaves `disk_hash` stale, and
+    // every later edit would then conflict whatever these checks do.
+    check_outside_change_during_edit(&ctrl, &id);
+    check_outside_change_during_untouched_edit(&ctrl, &id);
+    check_outside_delete_during_edit(&ctrl, &id);
     check_external_conflict(&ctrl, &id);
 
     // No explicit `window.destroy()`: on GTK 4.22 + gtk4-layer-shell 1.3 it
