@@ -22,6 +22,8 @@ pub enum TrayCommand {
     NewNote,
     ShowAll,
     HideAll,
+    /// Left click: show all if any note is hidden, else hide all.
+    Toggle,
     SendAllToDesktop,
     BringAllToFront,
     /// Move every note to the monitor at this index (handled directly by
@@ -41,6 +43,7 @@ pub fn action_name(cmd: TrayCommand) -> Option<&'static str> {
         TrayCommand::NewNote => Some("new-note"),
         TrayCommand::ShowAll => Some("show-all"),
         TrayCommand::HideAll => Some("hide-all"),
+        TrayCommand::Toggle => Some("toggle"),
         TrayCommand::SendAllToDesktop => Some("send-all-to-desktop"),
         TrayCommand::BringAllToFront => Some("bring-all-to-front"),
         TrayCommand::Arrange => Some("arrange"),
@@ -78,6 +81,10 @@ impl ksni::Tray for WaynoteTray {
 
     fn title(&self) -> String {
         "Waynote".into()
+    }
+
+    fn activate(&mut self, _x: i32, _y: i32) {
+        let _ = self.tx.send(TrayCommand::Toggle);
     }
 
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
@@ -256,6 +263,11 @@ mod tests {
     #[test]
     fn hide_all_maps_to_action() {
         assert_eq!(action_name(TrayCommand::HideAll), Some("hide-all"));
+    }
+
+    #[test]
+    fn action_name_toggle() {
+        assert_eq!(action_name(TrayCommand::Toggle), Some("toggle"));
     }
 
     #[test]
