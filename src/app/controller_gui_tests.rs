@@ -124,11 +124,17 @@ fn check_layer_change_during_edit(ctrl: &Rc<RefCell<Controller>>, id: &NoteId) {
             .count()
     };
     let before = conflict_copies(&ctrl.borrow());
-    let body = "# Layer edit\nKeep this body.\n";
+    // A different body each time: with one shared body, a lost commit would still
+    // find the previous iteration's identical text on disk.
     for layer in [Layer::Desktop, Layer::Front] {
-        replace_editor_text(ctrl, id, body);
+        let body = format!("# Layer edit\nTo {layer:?}.\n");
+        replace_editor_text(ctrl, id, &body);
         Controller::set_layer_durable(ctrl, id, layer.clone());
-        wait_until(|| ctrl.borrow().entries[id].edit_base_hash.is_none());
+        wait_until(|| {
+            let c = ctrl.borrow();
+            let entry = &c.entries[id];
+            entry.edit_base_hash.is_none() && entry.note.layer == layer
+        });
         let c = ctrl.borrow();
         let disk = frontmatter::parse(&std::fs::read_to_string(&c.entries[id].path).unwrap());
         assert_eq!(disk.body, body);
@@ -137,10 +143,12 @@ fn check_layer_change_during_edit(ctrl: &Rc<RefCell<Controller>>, id: &NoteId) {
     }
 
     // The header button flips the DURABLE layer. A Desktop note being edited is only
-    // transiently Front, so clicking there means "bring to front".
-    for (start, end) in [(Layer::Desktop, Layer::Front), (Layer::Front, Layer::Desktop)] {
+    // transiently Front, so clicking there means "bring to front". End on Front, where
+    // the note started: `check_surface_remapping` maps the note's surface next.
+    for (start, end) in [(Layer::Front, Layer::Desktop), (Layer::Desktop, Layer::Front)] {
+        let body = format!("# Layer button\n{start:?} to {end:?}.\n");
         Controller::set_layer_durable(ctrl, id, start);
-        replace_editor_text(ctrl, id, body);
+        replace_editor_text(ctrl, id, &body);
         let button = ctrl.borrow().entries[id].chrome.layer_button.clone();
         button.emit_clicked();
         wait_until(|| {
@@ -150,6 +158,7 @@ fn check_layer_change_during_edit(ctrl: &Rc<RefCell<Controller>>, id: &NoteId) {
         });
         let c = ctrl.borrow();
         let disk = frontmatter::parse(&std::fs::read_to_string(&c.entries[id].path).unwrap());
+        assert_eq!(disk.body, body);
         assert_eq!(disk.layer, end, "button did not flip the durable layer");
         assert_eq!(conflict_copies(&c), before, "button click created a false conflict");
     }
