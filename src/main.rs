@@ -18,10 +18,15 @@ fn apply_global_css() {
     // imperceptible and does not affect input (the Wayland input region is
     // authoritative and set explicitly).
     css.load_from_data("window { background: rgba(0,0,0,0.004); }");
+    // USER + 1, not APPLICATION: GTK loads ~/.config/gtk-4.0/gtk.css at USER, and
+    // a full theme there styles `window.background` too. Below it, that rule wins
+    // and paints every layer surface opaque (the desktop layer hides the
+    // wallpaper, the front layer covers every window), or clears this fill and
+    // brings the ghost frames back.
     gtk::style_context_add_provider_for_display(
         &Display::default().expect("display"),
         &css,
-        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        gtk::STYLE_PROVIDER_PRIORITY_USER + 1,
     );
 }
 
