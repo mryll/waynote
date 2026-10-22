@@ -33,6 +33,11 @@ pub fn install_card_css() {
     let css = CssProvider::new();
     #[allow(deprecated)]
     css.load_from_data(CARD_CSS);
+    // USER + 1, above ~/.config/gtk-4.0/gtk.css, like the window fill in main.rs:
+    // a full theme there would otherwise paint the `text` node that the TextTag
+    // ink relies on being transparent, and recolour the header controls. Deliberate:
+    // the paper look is fixed (the ink comes from TextTags), so gtk.css cannot
+    // override what this CSS sets.
     #[allow(deprecated)]
     gtk::style_context_add_provider_for_display(
         &gdk::Display::default().expect("display"),

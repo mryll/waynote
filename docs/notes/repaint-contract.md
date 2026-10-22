@@ -42,7 +42,10 @@ window { background: rgba(0,0,0,0.004); }  /* imperceptible */
 This is what makes the contract work (see "Why" below). It replaced an earlier
 equivalent that used a per-surface barely-opaque *child widget*; the window
 background is simpler (one rule, no child, no sizing or z-order concern) and was
-verified to clear the empty-surface case identically.
+verified to clear the empty-surface case identically. Its provider sits at
+`STYLE_PROVIDER_PRIORITY_USER + 1`, above `~/.config/gtk-4.0/gtk.css`, so a user
+theme cannot override the fill (an opaque one covers the desktop, a fully
+transparent one brings the ghost back).
 
 ### Map-time input-region hardening
 
