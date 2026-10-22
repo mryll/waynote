@@ -21,7 +21,7 @@ fn apply_global_css() {
     gtk::style_context_add_provider_for_display(
         &Display::default().expect("display"),
         &css,
-        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        gtk::STYLE_PROVIDER_PRIORITY_USER + 1,
     );
 }
 
