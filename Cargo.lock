@@ -1567,7 +1567,7 @@ dependencies = [
 
 [[package]]
 name = "waynote"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "gtk4",
  "gtk4-layer-shell",
