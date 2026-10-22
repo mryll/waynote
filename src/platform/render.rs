@@ -812,6 +812,9 @@ fn render_hr(ctx: &mut RenderCtx, iter: &mut gtk::TextIter) {
 
 fn render_list(ctx: &mut RenderCtx, list: &List, depth: usize, iter: &mut gtk::TextIter) {
     for (i, item) in list.items.iter().enumerate() {
+        for _ in 0..item.blank_before {
+            ctx.newline(iter);
+        }
         let number = list.start as usize + i;
         render_list_item(ctx, item, list.ordered, number, depth, iter);
     }

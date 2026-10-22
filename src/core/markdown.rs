@@ -43,6 +43,10 @@ pub struct List {
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct ListItem {
+    /// Blank lines typed between the previous item and this one (0 for a tight list
+    /// and for the first item). Recovered from the source: CommonMark only says a
+    /// list is loose as a whole.
+    pub blank_before: usize,
     pub task: Option<bool>,
     pub blocks: Vec<Block>,
 }
@@ -296,17 +300,34 @@ impl<'a> ParseCtx<'a> {
         loop {
             match self.peek() {
                 Some(Event::Start(Tag::Item)) => {
+                    let blank_before = if items.is_empty() { 0 } else { self.blank_lines_before(self.pos) };
                     self.next();
                     let task = self.peek_task();
                     let blocks = self.parse_blocks(false);
                     self.next();
-                    items.push(ListItem { task, blocks });
+                    items.push(ListItem { blank_before, task, blocks });
                 }
                 Some(Event::End(_)) | None => break,
                 _ => { self.next(); }
             }
         }
         items
+    }
+
+    /// Blank lines in the SOURCE immediately before the event at `pos`: walk back over
+    /// whitespace counting '\n'; the line break ending the previous line is not blank.
+    fn blank_lines_before(&self, pos: usize) -> usize {
+        let bytes = self.src.as_bytes();
+        let mut i = self.events[pos].1.start;
+        let mut nl = 0usize;
+        while i > 0 {
+            match bytes[i - 1] {
+                b'\n' => { nl += 1; i -= 1; }
+                b'\r' | b' ' | b'\t' => i -= 1,
+                _ => break,
+            }
+        }
+        nl.saturating_sub(1)
     }
 
     fn peek_task(&mut self) -> Option<bool> {
@@ -738,6 +759,19 @@ mod tests {
             outer.blocks.iter().any(|b| matches!(b, Block::List(_))),
             "nested list must still be parsed after the text"
         );
+    }
+
+    #[test]
+    fn items_remember_the_blank_lines_typed_before_them() {
+        let blanks = |src: &str| -> Vec<usize> {
+            only_list(&parse(src)).items.iter().map(|i| i.blank_before).collect()
+        };
+        assert_eq!(blanks("- a\n- b\n"), [0, 0]);
+        assert_eq!(blanks("- a\n\n- b\n"), [0, 1]);
+        assert_eq!(blanks("- a\n- b\n\n\n- c\n\n- d\n- e\n"), [0, 0, 2, 1, 0]);
+        assert_eq!(blanks("1. a\n\n2. b\n"), [0, 1]);
+        assert_eq!(blanks("- [ ] a\n\n- [x] b\n"), [0, 1]);
+        assert_eq!(blanks("- a\r\n\r\n- b\r\n"), [0, 1]);
     }
 
     #[test]
