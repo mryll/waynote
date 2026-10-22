@@ -905,6 +905,11 @@ fn render_item_content(
     depth: usize,
     iter: &mut gtk::TextIter,
 ) {
+    // An empty item (`-` alone) still ends its line, or the next item (or the blank
+    // lines typed before it) would land on the same line as this bullet.
+    if blocks.is_empty() {
+        ctx.newline(iter);
+    }
     for block in blocks {
         match block {
             Block::Paragraph(inlines) => {
