@@ -817,6 +817,9 @@ fn render_hr(ctx: &mut RenderCtx, iter: &mut gtk::TextIter) {
 
 fn render_list(ctx: &mut RenderCtx, list: &List, depth: usize, iter: &mut gtk::TextIter) {
     for (i, item) in list.items.iter().enumerate() {
+        for _ in 0..item.blank_before {
+            ctx.newline(iter);
+        }
         let number = list.start as usize + i;
         render_list_item(ctx, item, list.ordered, number, depth, iter);
     }
@@ -907,6 +910,11 @@ fn render_item_content(
     depth: usize,
     iter: &mut gtk::TextIter,
 ) {
+    // An empty item (`-` alone) still ends its line, or the next item (or the blank
+    // lines typed before it) would land on the same line as this bullet.
+    if blocks.is_empty() {
+        ctx.newline(iter);
+    }
     for block in blocks {
         match block {
             Block::Paragraph(inlines) => {

@@ -43,6 +43,10 @@ pub struct List {
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct ListItem {
+    /// Blank lines typed between the previous item and this one (0 for a tight list
+    /// and for the first item). Recovered from the source: CommonMark only says a
+    /// list is loose as a whole.
+    pub blank_before: usize,
     pub task: Option<bool>,
     pub blocks: Vec<Block>,
 }
@@ -128,8 +132,8 @@ impl<'a> ParseCtx<'a> {
     /// Parse a run of blocks. When `preserve_blanks` (root level only), emit a
     /// `Block::BlankLine` for each blank line the user typed beyond the normal
     /// paragraph separator, recovered from the SOURCE gap between consecutive
-    /// blocks. NOT done inside lists/quotes — there extra blanks would corrupt
-    /// tight/loose list spacing.
+    /// blocks. NOT done inside list items or quotes; the blank lines typed BETWEEN
+    /// list items travel on `ListItem::blank_before` instead.
     fn parse_blocks(&mut self, preserve_blanks: bool) -> Vec<Block> {
         let mut blocks = Vec::new();
         let mut seen_block = false;
@@ -296,17 +300,47 @@ impl<'a> ParseCtx<'a> {
         loop {
             match self.peek() {
                 Some(Event::Start(Tag::Item)) => {
+                    let blank_before = if items.is_empty() { 0 } else { self.blank_lines_before(self.pos) };
                     self.next();
                     let task = self.peek_task();
                     let blocks = self.parse_blocks(false);
                     self.next();
-                    items.push(ListItem { task, blocks });
+                    items.push(ListItem { blank_before, task, blocks });
                 }
                 Some(Event::End(_)) | None => break,
                 _ => { self.next(); }
             }
         }
         items
+    }
+
+    /// Blank lines in the SOURCE immediately before the item starting at `pos`: walk
+    /// back from its marker over whitespace counting '\n'. The line breaks the previous
+    /// block already holds are not blank: at least the one ending its last line, and
+    /// an unclosed fence also keeps the blank lines after it as code.
+    fn blank_lines_before(&self, pos: usize) -> usize {
+        let bytes = self.src.as_bytes();
+        let mut i = self.events[pos].1.start;
+        // pulldown starts an item at the line break before a tab-indented marker.
+        while matches!(bytes.get(i), Some(b'\n' | b'\r' | b' ' | b'\t')) {
+            i += 1;
+        }
+        let mut nl = 0usize;
+        while i > 0 {
+            match bytes[i - 1] {
+                b'\n' => { nl += 1; i -= 1; }
+                b'\r' | b' ' | b'\t' => i -= 1,
+                _ => break,
+            }
+        }
+        // The previous block's last content event, past the End events that close
+        // there; a Start instead means an empty item, which holds no line break.
+        let last = self.events[..pos].iter().rev().find(|(e, _)| !matches!(e, Event::End(_)));
+        let held = match last {
+            Some((Event::Start(_), _)) | None => 0,
+            Some((_, r)) => bytes[i..r.end.max(i)].iter().filter(|&&b| b == b'\n').count(),
+        };
+        nl.saturating_sub(held.max(1))
     }
 
     fn peek_task(&mut self) -> Option<bool> {
@@ -316,6 +350,12 @@ impl<'a> ParseCtx<'a> {
                 self.next();
                 Some(v)
             }
+            // A loose item wraps its text in a paragraph, marker included; the inline
+            // parser skips the marker.
+            Some(Event::Start(Tag::Paragraph)) => match self.events.get(self.pos + 1) {
+                Some((Event::TaskListMarker(checked), _)) => Some(*checked),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -722,6 +762,35 @@ mod tests {
     }
 
     #[test]
+    fn loose_task_items_keep_their_checkboxes_and_labels() {
+        let l = only_list(&parse("- [ ] todo\n\n- [x] done\n")).clone();
+        assert_eq!(l.items[0].task, Some(false));
+        assert_eq!(item_text(&l.items[0]), "todo");
+        assert_eq!(l.items[1].task, Some(true));
+        assert_eq!(item_text(&l.items[1]), "done");
+    }
+
+    #[test]
+    fn every_task_the_toggle_counts_is_a_task_item() {
+        // The view numbers its checkboxes in document order and `toggle_task` flips
+        // the Nth marker, so a marker without a checkbox shifts every later click.
+        fn tasks(blocks: &[Block]) -> usize {
+            blocks
+                .iter()
+                .map(|b| match b {
+                    Block::List(l) => {
+                        l.items.iter().map(|i| usize::from(i.task.is_some()) + tasks(&i.blocks)).sum()
+                    }
+                    Block::Quote(inner) => tasks(inner),
+                    _ => 0,
+                })
+                .sum()
+        }
+        let src = "- [ ] a\n\n- [ ] b\n\ntext\n\n- [ ] c\n  - [x] d\n\n  - [ ] e\n";
+        assert_eq!(tasks(&parse(src).blocks), task_count(src));
+    }
+
+    #[test]
     fn tight_ordered_items_keep_their_text() {
         let l = only_list(&parse("1. one\n2. two\n")).clone();
         assert!(l.ordered);
@@ -738,6 +807,102 @@ mod tests {
             outer.blocks.iter().any(|b| matches!(b, Block::List(_))),
             "nested list must still be parsed after the text"
         );
+    }
+
+    fn blanks(src: &str) -> Vec<usize> {
+        only_list(&parse(src)).items.iter().map(|i| i.blank_before).collect()
+    }
+    fn nested_list(item: &ListItem) -> &List {
+        item.blocks
+            .iter()
+            .find_map(|b| match b {
+                Block::List(l) => Some(l),
+                _ => None,
+            })
+            .expect("item should hold a nested list")
+    }
+
+    #[test]
+    fn items_remember_the_blank_lines_typed_before_them() {
+        assert_eq!(blanks("- a\n- b\n"), [0, 0]);
+        assert_eq!(blanks("- a\n\n- b\n"), [0, 1]);
+        assert_eq!(blanks("- a\n- b\n\n\n- c\n\n- d\n- e\n"), [0, 0, 2, 1, 0]);
+        assert_eq!(blanks("1. a\n\n2. b\n"), [0, 1]);
+        assert_eq!(blanks("- [ ] a\n\n- [x] b\n"), [0, 1]);
+        assert_eq!(blanks("- a\r\n\r\n- b\r\n"), [0, 1]);
+    }
+
+    #[test]
+    fn nested_items_keep_their_own_gaps_and_the_outer_item_keeps_the_one_after_them() {
+        let l = only_list(&parse("- a\n  - b\n\n  - c\n\n- d\n")).clone();
+        assert_eq!(l.items.iter().map(|i| i.blank_before).collect::<Vec<_>>(), [0, 1]);
+        let inner = nested_list(&l.items[0]);
+        assert_eq!(inner.items.iter().map(|i| i.blank_before).collect::<Vec<_>>(), [0, 1]);
+    }
+
+    #[test]
+    fn a_blank_line_before_the_first_item_of_a_nested_list_is_not_kept() {
+        let l = only_list(&parse("- a\n\n  - b\n")).clone();
+        assert_eq!(nested_list(&l.items[0]).items[0].blank_before, 0);
+    }
+
+    #[test]
+    fn tab_indented_nested_items_keep_their_gaps() {
+        // pulldown starts these items at the line break before the tab.
+        let srcs = ["- a\n\t- b\n\n\t- c\n", "- a\r\n\t- b\r\n\r\n\t- c\r\n", "1. a\n\t1. b\n\n\t2. c\n"];
+        for src in srcs {
+            let l = only_list(&parse(src)).clone();
+            let inner = nested_list(&l.items[0]);
+            assert_eq!(inner.items.iter().map(|i| i.blank_before).collect::<Vec<_>>(), [0, 1], "{src:?}");
+        }
+        let l = only_list(&parse("- a\n\t- b\n\n\n\t- c\n")).clone();
+        assert_eq!(nested_list(&l.items[0]).items[1].blank_before, 2);
+    }
+
+    #[test]
+    fn a_blank_line_inside_an_item_is_not_a_gap_before_the_next_one() {
+        assert_eq!(blanks("- a\n\n  b\n- c\n"), [0, 0]);
+    }
+
+    #[test]
+    fn gaps_after_code_blocks_count_only_the_lines_outside_the_code() {
+        // An indented code block drops its trailing blank lines: both are gaps.
+        assert_eq!(blanks("- a\n\n      code\n\n\n- b\n"), [0, 2]);
+        // Blank lines inside a closed fence are code, not a gap.
+        assert_eq!(blanks("- a\n  ```\n  x\n\n\n  ```\n- b\n"), [0, 0]);
+    }
+
+    #[test]
+    fn a_line_of_spaces_or_tabs_counts_as_a_blank_line() {
+        assert_eq!(blanks("- a\n\t\n- b\n"), [0, 1]);
+        assert_eq!(blanks("- a  \r\n \t\r\n- b\r\n"), [0, 1]);
+    }
+
+    #[test]
+    fn gaps_are_counted_after_lazy_lines_multibyte_text_and_empty_items() {
+        assert_eq!(blanks("- a\nlazy\n\n- b\n"), [0, 1]);
+        assert_eq!(blanks("- café — 日本\n\n- ü\n"), [0, 1]);
+        assert_eq!(blanks("-\n\n- b\n"), [0, 1]);
+    }
+
+    #[test]
+    fn a_list_inside_a_quote_keeps_no_gaps() {
+        // The `>` ends the walk. Accepted: blank lines inside a quote are not kept
+        // between its paragraphs either.
+        let doc = parse("> - a\n>\n> - b\n");
+        let Block::Quote(inner) = &doc.blocks[0] else { panic!("expected quote") };
+        let Block::List(l) = &inner[0] else { panic!("expected list") };
+        assert_eq!(l.items[1].blank_before, 0);
+    }
+
+    #[test]
+    fn a_blank_line_kept_by_an_unclosed_fence_is_not_a_gap_too() {
+        // The fence ends with its item and keeps the blank lines after it as code.
+        let l = only_list(&parse("- a\n\n  ```\n  code\n\n- b\n")).clone();
+        assert!(matches!(&l.items[0].blocks[1], Block::Code { text, .. } if text == "code\n\n"));
+        assert_eq!(l.items[1].blank_before, 0);
+        let l = only_list(&parse("- a\n  - b\n\n    ```\n    code\n\n\n- c\n")).clone();
+        assert_eq!(l.items[1].blank_before, 0);
     }
 
     #[test]
