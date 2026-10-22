@@ -667,7 +667,11 @@ fn wire_layer_button(
         let (weak, id) = (weak.clone(), id.clone());
         glib::idle_add_local_once(move || {
             let Some(ctrl) = weak.upgrade() else { return };
-            let current = ctrl.borrow().entries.get(&id).map(|e| e.note.layer.clone());
+            // `note.layer` reads Front while a Desktop note is only fronted for editing;
+            // flip the durable layer, as `persist_entry` saves it.
+            let current = ctrl.borrow().entries.get(&id).map(|e| {
+                if e.temporarily_fronted { Layer::Desktop } else { e.note.layer.clone() }
+            });
             match current {
                 Some(Layer::Front) => Controller::send_to_desktop(&ctrl, &id),
                 Some(Layer::Desktop) => Controller::bring_to_front(&ctrl, &id),
@@ -1028,6 +1032,7 @@ fn make_entry(
         pending_layout_save: None,
         temporarily_fronted: false,
         pending_color: None,
+        pending_layer: None,
     }
 }
 
@@ -1484,7 +1489,7 @@ pub fn relayer_ids<'a>(
 /// If note `id` is being edited, commit that edit (the real persist is deferred to
 /// idle by the NoteView sink) and schedule `f` on a LATER idle so it runs AFTER the
 /// edit persists; return `true`. Otherwise return `false` and the caller runs `f`
-/// synchronously. Frontmatter-only changes (pin/lock/colour) must use this: persisting the
+/// synchronously. Frontmatter-only changes (pin/lock/colour/layer) must use this: persisting the
 /// toggle BEFORE the queued edit commit makes that commit see an external disk
 /// change and write a spurious conflict copy. Idle callbacks run FIFO, so `f` (queued
 /// after the edit-commit idle) is guaranteed to run last.
@@ -1873,7 +1878,31 @@ impl Controller {
     }
 
     /// Internal: flip a note's layer, persist, and re-sync both surfaces.
+    ///
+    /// If the note is mid-edit, the flip is deferred until after the edit commit
+    /// persists (`defer_after_edit_commit`), like `toggle_pin`. The edit is committed
+    /// even when the request turns out to be a no-op (pinned, or already on
+    /// `new_layer`): the guard runs at apply time, once a temporarily fronted note is
+    /// back on Desktop, so it compares against the durable layer.
     fn set_layer_durable(this: &Rc<RefCell<Self>>, id: &NoteId, new_layer: Layer) {
+        {
+            let mut c = this.borrow_mut();
+            let Some(entry) = c.entries.get_mut(id) else { return };
+            entry.pending_layer = Some(new_layer);
+        }
+        if defer_after_edit_commit(this, id, Self::apply_pending_layer) {
+            return;
+        }
+        Self::apply_pending_layer(this, id);
+    }
+
+    fn apply_pending_layer(this: &Rc<RefCell<Self>>, id: &NoteId) {
+        let pending = this
+            .borrow_mut()
+            .entries
+            .get_mut(id)
+            .and_then(|entry| entry.pending_layer.take());
+        let Some(new_layer) = pending else { return };
         // Pinned notes are anchored (durable layer frozen); same-layer transitions are
         // no-ops. The UI disables the ▲/▼ button when pinned, but the D-Bus
         // send-to-desktop / bring-to-front actions can still reach here — guard both.
@@ -1928,12 +1957,18 @@ impl Controller {
     ///   note's persist is DEFERRED (by the edit-commit idle tick); we set its
     ///   in-memory layer here but skip the synchronous re-persist, otherwise the
     ///   deferred save would see an advanced disk hash and write a spurious
-    ///   conflict copy.
+    ///   conflict copy. The same holds for any note whose edit commit is still
+    ///   queued, and any per-note layer request still deferred is dropped.
     fn set_all_layers_durable(this: &Rc<RefCell<Self>>, new_layer: Layer) {
         // Capture + commit any active editor BEFORE touching layers.
         let active = this.borrow().active_editor.clone();
         if let Some(active_id) = &active {
             this.borrow_mut().commit_current_editor(active_id);
+        }
+        // A global move is the newest layer request: drop any per-note request still
+        // deferred behind an edit commit, or its apply would undo this one.
+        for entry in this.borrow_mut().entries.values_mut() {
+            entry.pending_layer = None;
         }
 
         // Collect every UNPINNED note whose layer differs (read AFTER commit/restore).
@@ -1946,16 +1981,17 @@ impl Controller {
         };
 
         for id in &ids {
-            let is_active = active.as_ref() == Some(id);
             let outcome = {
                 let mut c = this.borrow_mut();
                 let Some(entry) = c.entries.get_mut(id) else { continue };
                 entry.note.layer = new_layer.clone();
                 entry.surface_key.layer = surface_layer_of(&entry.note.layer);
                 entry.chrome.set_layer(&entry.note.layer);
-                // The just-committed note is persisted by its deferred edit-commit
-                // (with the layer we set above); persisting again here would clash.
-                if is_active {
+                // A note whose edit commit is still queued (the editor just committed
+                // above, or one a deferred change committed earlier) is persisted by that
+                // commit, with the layer set above; persisting here first would make that
+                // commit see a false conflict.
+                if entry.edit_base_hash.is_some() {
                     None
                 } else {
                     Some(persist_entry(entry, now_ts()))
@@ -2279,6 +2315,7 @@ impl Controller {
                 pending_layout_save: None,
                 temporarily_fronted: false,
                 pending_color: None,
+                pending_layer: None,
             };
             c.entries.insert(id.clone(), entry);
 
