@@ -209,14 +209,35 @@ impl Controller {
     /// the action; this dispatches to a small per-variant helper. The whole path
     /// runs on the GTK main thread (the drain timeout source), so building
     /// widgets here is safe.
+    ///
+    /// A reload or drop for a note with an edit in flight waits: the reload would
+    /// swap the editor for the view page and the drop would discard it, losing the
+    /// typed text either way. `known` is left behind on purpose, so the watcher
+    /// reports the change again on later scans. The edit's save compares the disk
+    /// with the hash taken when the edit began: an outside change stays in the file
+    /// and the typed text goes to a conflict copy, whose write brings the scan that
+    /// reloads the note; a deleted file is written again. An edit that changed
+    /// nothing saves nothing and runs that scan itself (`commit_edit`). A
+    /// rename applies at once, so the save goes to the file's new path.
     pub fn apply_change(this: &Rc<RefCell<Self>>, change: Change) {
         match intent_for(&change) {
+            ApplyIntent::Reload(id) | ApplyIntent::Drop(id)
+                if this.borrow().edit_in_flight(&id) =>
+            {
+                eprintln!("[waynote] {id} changed on disk while editing; held until the edit is saved");
+            }
             ApplyIntent::Reload(id) => Self::apply_reload(this, &id),
             ApplyIntent::Drop(id) => Self::apply_drop(this, &id),
             ApplyIntent::Repath { id, new_path } => Self::apply_repath(this, &id, &new_path),
         }
         // An external add/remove may have flipped whether any notes exist.
         Self::refresh_tray_note_state(this);
+    }
+
+    /// Whether note `id` has an edit in flight: open in the editor, or committed
+    /// with its save still queued behind an idle tick (see `defer_after_edit_commit`).
+    fn edit_in_flight(&self, id: &NoteId) -> bool {
+        self.entries.get(id).map(|e| e.edit_base_hash.is_some()).unwrap_or(false)
     }
 
     /// Added or Modified: (re)read the file, then either re-render an existing
@@ -360,14 +381,15 @@ impl Controller {
     /// the save; the NoteView only emitted. Runs on the GTK thread, called from an
     /// idle tick (see `install_event_handlers`) so no NoteView borrow is held.
     ///
-    /// Image paste and colour changes are dispatched through the handler closure,
-    /// which holds the `Rc` needed for those actions.
+    /// Image paste, colour changes and edit commits are dispatched through the
+    /// handler closure, which holds the `Rc` needed for those actions.
     pub fn handle_event(&mut self, id: &NoteId, ev: NoteEvent) {
         match ev {
             NoteEvent::EditRequested => self.on_edit_requested(id),
-            NoteEvent::EditCommitted(raw) => self.on_edit_committed(id, raw),
             NoteEvent::TaskToggled(idx) => self.on_task_toggled(id, idx),
-            NoteEvent::ColorRequested(_) | NoteEvent::PasteImageRequested => {}
+            NoteEvent::EditCommitted(_)
+            | NoteEvent::ColorRequested(_)
+            | NoteEvent::PasteImageRequested => {}
             NoteEvent::CollapseToggled => self.on_collapse_toggled(id),
         }
     }
@@ -472,6 +494,7 @@ impl Controller {
         // 2. Capture base hash + mark active.
         if let Some(entry) = self.entries.get_mut(id) {
             entry.edit_base_hash = Some(entry.disk_hash.clone());
+            entry.edit_start_hash = Some(save_hash(&note_for_save(entry)));
         }
         self.active_editor = Some(id.clone());
         self.refresh_active(id);
@@ -515,18 +538,49 @@ impl Controller {
         self.refresh_active(id);
     }
 
+    /// Persist an edit commit. An edit that left the note as it started writes
+    /// nothing, so the watcher gets no event to scan again, and a change it held
+    /// during the edit (`apply_change`) would wait for an unrelated one. Run the
+    /// watcher's reconcile for this note now instead: the change lands as if the
+    /// note had never been open. A colour or layer change deferred behind this
+    /// commit (`defer_after_edit_commit`) runs after it and saves on top.
+    fn commit_edit(this: &Rc<RefCell<Self>>, id: &NoteId, raw: String) {
+        if !this.borrow_mut().on_edit_committed(id, raw) {
+            return;
+        }
+        let (ws, notes_dir) = {
+            let c = this.borrow();
+            (Arc::clone(&c.watch_state), c.paths.notes_dir())
+        };
+        let scanned = watcher::rescan(&notes_dir);
+        let changes = match ws.lock() {
+            Ok(ws) => crate::core::reconcile::reconcile(&ws.known, &scanned, &ws.own_writes),
+            Err(_) => return,
+        };
+        for change in changes.into_iter().filter(|c| change_note(c) == id.as_str()) {
+            Self::apply_change(this, change);
+        }
+    }
+
     /// Adopt the edited raw as the note body, persist it, and refresh the header
     /// title. The NoteView already re-rendered its content from the same raw.
     /// Also ends the keyboard edit session (clear `active_editor`, restore modes
     /// and layer per Task 8).
-    fn on_edit_committed(&mut self, id: &NoteId, raw: String) {
-        let Some(entry) = self.entries.get_mut(id) else { return };
+    ///
+    /// Returns `true` when the edit left the note as it started, so nothing was
+    /// written: there is no text of the user's to keep, and a save against a disk
+    /// that changed meanwhile would only file the old text as a conflict copy.
+    fn on_edit_committed(&mut self, id: &NoteId, raw: String) -> bool {
+        let Some(entry) = self.entries.get_mut(id) else { return false };
         set_body_from_raw(&mut entry.note, &raw);
         let title = entry.note.title();
-        let outcome = persist_entry(entry, now_ts());
+        let unchanged = entry.edit_start_hash.take() == Some(save_hash(&note_for_save(entry)));
+        let outcome = (!unchanged).then(|| persist_entry(entry, now_ts()));
         entry.edit_base_hash = None;
         entry.chrome.set_title(&title);
-        self.after_persist(id, outcome);
+        if let Some(outcome) = outcome {
+            self.after_persist(id, outcome);
+        }
 
         // End the edit session: clear active editor, restore keyboard modes, and
         // move the note back to Desktop if it was temporarily fronted.
@@ -536,6 +590,7 @@ impl Controller {
             restore_layer_if_needed(self, id);
         }
         self.refresh_active(id);
+        unchanged
     }
 
     /// Flip the indexed checkbox, persist, and re-render the NoteView from the new
@@ -617,6 +672,7 @@ fn dispatch_note_event(ctrl: &Rc<RefCell<Controller>>, id: &NoteId, ev: NoteEven
     match ev {
         NoteEvent::PasteImageRequested => Controller::paste_image(ctrl, id),
         NoteEvent::ColorRequested(color) => Controller::set_color(ctrl, id, &color),
+        NoteEvent::EditCommitted(raw) => Controller::commit_edit(ctrl, id, raw),
         other => ctrl.borrow_mut().handle_event(id, other),
     }
 }
@@ -1025,6 +1081,7 @@ fn make_entry(
         path,
         disk_hash,
         edit_base_hash: None,
+        edit_start_hash: None,
         surface_key,
         hidden: false,
         collapsed,
@@ -1176,16 +1233,7 @@ fn persist_entry(entry: &mut NoteEntry, ts: String) -> PersistOutcome {
         .edit_base_hash
         .clone()
         .unwrap_or_else(|| entry.disk_hash.clone());
-    let effective_layer = if entry.temporarily_fronted {
-        crate::core::note::Layer::Desktop
-    } else {
-        entry.note.layer.clone()
-    };
-    let note_for_save = crate::core::note::Note {
-        layer: effective_layer,
-        ..entry.note.clone()
-    };
-    let outcome = store::save_checked_to(&entry.path, &note_for_save, &base, &ts)
+    let outcome = store::save_checked_to(&entry.path, &note_for_save(entry), &base, &ts)
         .expect("path-aware save");
     match outcome {
         SaveOutcome::Saved(hash) => {
@@ -1193,6 +1241,35 @@ fn persist_entry(entry: &mut NoteEntry, ts: String) -> PersistOutcome {
             PersistOutcome::Saved(hash)
         }
         SaveOutcome::Conflict(path) => PersistOutcome::Conflict(path),
+    }
+}
+
+/// The note as `persist_entry` writes it: a note temporarily fronted for editing
+/// keeps its original Desktop layer on disk (M6).
+fn note_for_save(entry: &NoteEntry) -> crate::core::note::Note {
+    let effective_layer = if entry.temporarily_fronted {
+        crate::core::note::Layer::Desktop
+    } else {
+        entry.note.layer.clone()
+    };
+    crate::core::note::Note {
+        layer: effective_layer,
+        ..entry.note.clone()
+    }
+}
+
+/// PURE: the hash of `note` as it would be written. Notes that hash the same write
+/// the same file, so an edit that ends with the hash it began with saved nothing.
+/// A frontmatter-only change (a layer set while the note is being edited) counts.
+fn save_hash(note: &crate::core::note::Note) -> String {
+    crate::core::content_hash::content_hash(frontmatter::serialize(note).as_bytes())
+}
+
+/// The note a reconcile `Change` is about.
+fn change_note(change: &Change) -> &str {
+    match change {
+        Change::Added(id) | Change::Modified(id) | Change::Removed(id) => id,
+        Change::Renamed { id, .. } => id,
     }
 }
 
@@ -2308,6 +2385,7 @@ impl Controller {
                 path: path.clone(),
                 disk_hash: disk_hash.clone(),
                 edit_base_hash: None,
+                edit_start_hash: None,
                 surface_key: surface_key.clone(),
                 hidden: false,
                 collapsed: false, // a brand-new note always starts unrolled
@@ -2492,6 +2570,31 @@ mod tests {
         assert_eq!(toggled_raw(md, 0).as_deref(), Some("- [x] a\n- [x] b\n"));
         assert_eq!(toggled_raw(md, 1).as_deref(), Some("- [ ] a\n- [ ] b\n"));
         assert_eq!(toggled_raw(md, 5), None, "out-of-range index is a no-op");
+    }
+
+    #[test]
+    fn an_untouched_edit_of_a_hand_written_note_hashes_as_it_began() {
+        // No `locked` key: the file's own bytes are not what a save would write.
+        let file = "---\nid: \"01JZ9P6S0R8ZX0G8N3Z4V7Y8QK\"\ncolor: yellow\npinned: false\n\
+                    layer: front\ntags: []\n---\n# QA note\nOriginal line.\n";
+        let mut note = frontmatter::parse(file);
+        let start = save_hash(&note);
+        assert_ne!(start, crate::core::content_hash::content_hash(file.as_bytes()));
+        let untouched = note.body.clone();
+        set_body_from_raw(&mut note, &untouched);
+        assert_eq!(save_hash(&note), start);
+    }
+
+    #[test]
+    fn an_edit_of_the_body_or_only_the_frontmatter_hashes_differently() {
+        let mut note = new_note("01JZ9P6S0R8ZX0G8N3Z4V7Y8QK".into(), "yellow", &Layer::Front);
+        note.body = "# QA note\nOriginal line.\n".into();
+        let start = save_hash(&note);
+        let mut typed = note.clone();
+        set_body_from_raw(&mut typed, "# QA note\nTyped line.\n");
+        assert_ne!(save_hash(&typed), start);
+        let relayered = crate::core::note::Note { layer: Layer::Desktop, ..note };
+        assert_ne!(save_hash(&relayered), start);
     }
 
     #[test]

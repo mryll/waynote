@@ -48,6 +48,10 @@ pub struct NoteEntry {
     // used in Plan 5 Task 5-6
     #[allow(dead_code)]
     pub edit_base_hash: Option<String>,
+    /// The note as it would be saved, hashed on edit-enter. A commit that hashes
+    /// the same changed nothing, even when the file's own bytes differ (a
+    /// hand-written frontmatter is normalized on save).
+    pub edit_start_hash: Option<String>,
     /// (output, layer) the note belongs to; the presenter resolves it to a
     /// surface index. Read by the cross-surface moves in Task 10.
     // used in Plan 5 Task 10 (model-driven layer/monitor moves)
