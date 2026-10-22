@@ -1,5 +1,6 @@
 //! StatusNotifierItem tray via `ksni`. ksni runs its OWN thread (blocking API);
-//! menu clicks send a `Send` `TrayCommand` over an mpsc channel that a
+//! menu clicks and the icon's activation (SNI `Activate` — a left click on most
+//! hosts) send a `Send` `TrayCommand` over an mpsc channel that a
 //! `glib::timeout_add_local` drain on the GTK main thread maps to GApplication
 //! actions / `app.quit()` — the SAME cross-thread bridge as
 //! `Controller::start_watcher` (controller.rs).
@@ -22,6 +23,9 @@ pub enum TrayCommand {
     NewNote,
     ShowAll,
     HideAll,
+    /// Icon activation (SNI `Activate`, usually a left click): show all if any
+    /// note is hidden, else hide all.
+    Toggle,
     SendAllToDesktop,
     BringAllToFront,
     /// Move every note to the monitor at this index (handled directly by
@@ -41,6 +45,7 @@ pub fn action_name(cmd: TrayCommand) -> Option<&'static str> {
         TrayCommand::NewNote => Some("new-note"),
         TrayCommand::ShowAll => Some("show-all"),
         TrayCommand::HideAll => Some("hide-all"),
+        TrayCommand::Toggle => Some("toggle"),
         TrayCommand::SendAllToDesktop => Some("send-all-to-desktop"),
         TrayCommand::BringAllToFront => Some("bring-all-to-front"),
         TrayCommand::Arrange => Some("arrange"),
@@ -78,6 +83,10 @@ impl ksni::Tray for WaynoteTray {
 
     fn title(&self) -> String {
         "Waynote".into()
+    }
+
+    fn activate(&mut self, _x: i32, _y: i32) {
+        let _ = self.tx.send(TrayCommand::Toggle);
     }
 
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
@@ -256,6 +265,25 @@ mod tests {
     #[test]
     fn hide_all_maps_to_action() {
         assert_eq!(action_name(TrayCommand::HideAll), Some("hide-all"));
+    }
+
+    #[test]
+    fn toggle_maps_to_action() {
+        assert_eq!(action_name(TrayCommand::Toggle), Some("toggle"));
+    }
+
+    #[test]
+    fn activating_the_icon_sends_one_toggle() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut tray = WaynoteTray {
+            tx,
+            monitors: Vec::new(),
+            confirm_delete: Default::default(),
+            has_notes: Default::default(),
+        };
+        ksni::Tray::activate(&mut tray, 0, 0);
+        assert_eq!(rx.try_recv(), Ok(TrayCommand::Toggle));
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
