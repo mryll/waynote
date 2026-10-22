@@ -200,6 +200,9 @@ impl<'a> ParseCtx<'a> {
             Event::Start(Tag::CodeBlock(_)) => {
                 self.parse_code_block()
             }
+            Event::Start(Tag::HtmlBlock) => {
+                Some(self.parse_html_block())
+            }
             Event::Start(Tag::BlockQuote(_)) => {
                 self.next();
                 let inner = self.parse_blocks(false);
@@ -293,6 +296,33 @@ impl<'a> ParseCtx<'a> {
             }
         }
         Some(Block::Code { lang, text })
+    }
+
+    /// An HTML block shows the text the user typed, never interpreted: a paragraph
+    /// with one line per source line. Dropping it like an inline tag would lose plain
+    /// text too, because the block runs on past its tag: to the next blank line, or
+    /// to the end of the note for an unclosed `<!--`.
+    fn parse_html_block(&mut self) -> Block {
+        self.next();
+        let mut raw = String::new();
+        loop {
+            match self.next() {
+                // A Text holds the indent before the block's first line.
+                Some(Event::Html(s)) | Some(Event::Text(s)) => raw.push_str(s),
+                Some(Event::End(TagEnd::HtmlBlock)) | None => break,
+                _ => {}
+            }
+        }
+        let mut inlines = Vec::new();
+        for (i, line) in raw.lines().enumerate() {
+            if i > 0 {
+                inlines.push(Inline::SoftBreak);
+            }
+            if !line.is_empty() {
+                inlines.push(Inline::Text(line.to_string()));
+            }
+        }
+        Block::Paragraph(inlines)
     }
 
     fn parse_list_items(&mut self) -> Vec<ListItem> {
@@ -1006,11 +1036,93 @@ mod tests {
 
     #[test]
     fn raw_html_dropped() {
-        // Raw HTML must not leak anywhere in the IR — neither as inline Text nor as
-        // any block carrying the `<b>` text.
+        // An inline HTML tag must not leak anywhere in the IR — neither as inline Text
+        // nor as any block carrying the `<b>` text. An HTML block is shown as typed
+        // instead (see the tests below).
         let doc = parse("<b>raw</b>");
         let leaks = doc.blocks.iter().any(block_has_angle_bracket);
         assert!(!leaks, "raw HTML must not leak into IR: {:?}", doc.blocks);
+    }
+
+    // ── HTML blocks: shown as typed, never swallow the rest of the note ───────
+    fn text_para(lines: &[&str]) -> Block {
+        let mut inlines = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            if i > 0 {
+                inlines.push(Inline::SoftBreak);
+            }
+            if !line.is_empty() {
+                inlines.push(Inline::Text((*line).into()));
+            }
+        }
+        Block::Paragraph(inlines)
+    }
+
+    #[test]
+    fn a_note_that_starts_with_an_html_block_keeps_the_text_after_it() {
+        assert_eq!(parse("<div>\n\nfoo\n").blocks, [text_para(&["<div>"]), text_para(&["foo"])]);
+    }
+
+    #[test]
+    fn an_html_block_shows_the_source_the_user_typed() {
+        assert_eq!(parse("<p>hi</p>\n").blocks, [text_para(&["<p>hi</p>"])]);
+        assert_eq!(parse("<div>\r\n  x\r\n</div>\r\n").blocks, [text_para(&["<div>", "  x", "</div>"])]);
+        assert_eq!(parse("  <div>\n  x\n").blocks, [text_para(&["  <div>", "  x"])]);
+    }
+
+    #[test]
+    fn a_task_inside_an_html_block_is_text_and_the_tasks_after_it_keep_their_numbers() {
+        let src = "<div>\n- [ ] fake\n</div>\n\n- [ ] real\n";
+        let doc = parse(src);
+        assert_eq!(doc.blocks[0], text_para(&["<div>", "- [ ] fake", "</div>"]));
+        let Block::List(l) = &doc.blocks[1] else { panic!("expected list") };
+        assert_eq!(l.items[0].task, Some(false));
+        assert_eq!(task_count(src), 1);
+    }
+
+    #[test]
+    fn plain_lines_captured_by_an_html_block_are_still_shown() {
+        // A lone tag starts a block that runs to the next blank line.
+        assert_eq!(
+            parse("API key:\n\n<paste-key-here>\nmore text\n\nend").blocks,
+            [text_para(&["API key:"]), text_para(&["<paste-key-here>", "more text"]), text_para(&["end"])]
+        );
+        // An unclosed comment runs to the end of the note, blank lines included.
+        assert_eq!(
+            parse("<!-- note\n\nall the rest\n").blocks,
+            [text_para(&["<!-- note", "", "all the rest"])]
+        );
+    }
+
+    #[test]
+    fn an_html_block_in_a_list_item_keeps_the_later_items_in_the_list_and_the_text_after_it() {
+        let doc = parse("- a\n- <div>\n- c\n\nafter\n");
+        let l = only_list(&doc);
+        assert_eq!(l.items.iter().map(item_text).collect::<Vec<_>>(), ["a", "<div>", "c"]);
+        assert_eq!(l.items.iter().map(|i| i.blank_before).collect::<Vec<_>>(), [0, 0, 0]);
+        assert_eq!(doc.blocks[1..], [text_para(&["after"])]);
+
+        // After the item's own text.
+        let l = only_list(&parse("- a\n  <div>\n- c\n")).clone();
+        assert_eq!(l.items[0].blocks, [text_para(&["a"]), text_para(&["<div>"])]);
+        assert_eq!(item_text(&l.items[1]), "c");
+    }
+
+    #[test]
+    fn a_blank_line_after_an_html_block_in_a_list_item_is_one_gap() {
+        assert_eq!(blanks("- <div>\n\n- c\n"), [0, 1]);
+        // An unclosed comment keeps the blank line as its own; it is not a gap too.
+        let l = only_list(&parse("- <!-- x\n\n- b\n")).clone();
+        assert_eq!(l.items[0].blocks, [text_para(&["<!-- x", ""])]);
+        assert_eq!(l.items[1].blank_before, 0);
+    }
+
+    #[test]
+    fn an_html_block_in_a_quote_stays_in_the_quote() {
+        assert_eq!(
+            parse("> <div>\n> x\n\nafter\n").blocks,
+            [Block::Quote(vec![text_para(&["<div>", "x"])]), text_para(&["after"])]
+        );
     }
 
     // ── Task 2: heading style table ───────────────────────────────────────────
