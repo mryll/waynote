@@ -2323,6 +2323,8 @@ impl Controller {
         use crate::app::monitor_resolve::active_monitor;
         use crate::platform::store;
 
+        // Empty text is a plain new note, opened for editing.
+        let body = body.filter(|b| !b.is_empty());
         let (id, note, path, monitor_idx, entry_count, default_size) = {
             let mut c = this.borrow_mut();
             let id = c.idgen.new_id();
