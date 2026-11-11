@@ -10,6 +10,7 @@
 //!   `toggle-pin`, `toggle-lock`, `delete`.
 //! - `new-note-on`: param is a monitor connector (e.g. `"DP-2"`); empty string
 //!   means "no explicit monitor" (same fallback as the bare `new-note`).
+//! - `new-note-with`: param is `(connector, body)`; the note starts with that text.
 //! - `set-color`: param is `"<note-id>:<color>"` (e.g. `"01JZ9...:blue"`).
 //!   ULID ids are uppercase Base32 (no colon), so the first `:` always splits
 //!   id from color unambiguously.
@@ -48,6 +49,7 @@ pub fn register(app: &gtk::Application, ctrl: &Rc<RefCell<Controller>>) {
     register_set_color(app, ctrl);
     register_move_to_monitor(app, ctrl);
     register_new_note_on(app, ctrl);
+    register_new_note_with(app, ctrl);
 }
 
 // ── Parameterless actions ─────────────────────────────────────────────────────
@@ -65,7 +67,7 @@ fn register_parameterless(app: &gtk::Application, ctrl: &Rc<RefCell<Controller>>
 fn add_new_note(app: &gtk::Application, ctrl: Rc<RefCell<Controller>>) {
     let action = gio::SimpleAction::new("new-note", None);
     action.connect_activate(move |_, _| {
-        Controller::create_note(&ctrl, None);
+        Controller::create_note(&ctrl, None, None);
     });
     app.add_action(&action);
 }
@@ -202,7 +204,22 @@ fn register_new_note_on(app: &gtk::Application, ctrl: &Rc<RefCell<Controller>>) 
         // An empty connector means "no explicit monitor": fall back to the normal
         // pointer → last-used → primary resolution (same as the bare `new-note`).
         let explicit = (!connector.is_empty()).then_some(connector);
-        Controller::create_note(&ctrl, explicit.as_deref());
+        Controller::create_note(&ctrl, explicit.as_deref(), None);
+    });
+    app.add_action(&action);
+}
+
+// ── new-note-with: create a note with initial text ─────────────────────────────
+
+/// `(connector, body)`: an empty connector means "no explicit monitor", as for
+/// `new-note-on`. The note is shown with the text, not opened for editing.
+fn register_new_note_with(app: &gtk::Application, ctrl: &Rc<RefCell<Controller>>) {
+    let ctrl = Rc::clone(ctrl);
+    let action = gio::SimpleAction::new("new-note-with", Some(gtk::glib::VariantTy::new("(ss)").unwrap()));
+    action.connect_activate(move |_, param| {
+        let Some((connector, body)) = param.and_then(|p| p.get::<(String, String)>()) else { return };
+        let explicit = (!connector.is_empty()).then_some(connector);
+        Controller::create_note(&ctrl, explicit.as_deref(), Some(&body));
     });
     app.add_action(&action);
 }

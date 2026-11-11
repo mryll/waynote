@@ -118,9 +118,11 @@ enum Cli {
 #[derive(Debug, PartialEq, Clone)]
 enum AppCommand {
     Run,
-    /// `waynote new [<monitor>]`: the optional connector (e.g. "DP-2") places the
-    /// note on a specific monitor; `None` falls back to pointer/last/primary.
-    New(Option<String>),
+    /// `waynote new [-c <text>] [<monitor>]`: the optional connector (e.g. "DP-2")
+    /// places the note on a specific monitor; `None` falls back to
+    /// pointer/last/primary. `content` is the note's initial text; `-` reads it
+    /// from stdin, which `main` does before the app starts.
+    New { monitor: Option<String>, content: Option<String> },
     ShowAll,
     HideAll,
     Toggle,
@@ -132,8 +134,16 @@ impl AppCommand {
     fn argv(&self) -> Vec<String> {
         match self {
             AppCommand::Run => vec!["waynote".into()],
-            AppCommand::New(None) => vec!["waynote".into(), "new".into()],
-            AppCommand::New(Some(m)) => vec!["waynote".into(), "new".into(), m.clone()],
+            AppCommand::New { monitor, content } => {
+                let mut argv = vec!["waynote".into(), "new".into()];
+                // One token: GApplication drops a lone `--` from argv, so a note whose
+                // text is `--` would lose it as a separate argument.
+                if let Some(text) = content {
+                    argv.push(format!("--content={text}"));
+                }
+                argv.extend(monitor.clone());
+                argv
+            }
             AppCommand::ShowAll => vec!["waynote".into(), "show-all".into()],
             AppCommand::HideAll => vec!["waynote".into(), "hide-all".into()],
             AppCommand::Toggle => vec!["waynote".into(), "toggle".into()],
@@ -152,7 +162,7 @@ enum AutostartArg {
 fn parse_cli(args: &[String]) -> Cli {
     match args.first().map(String::as_str) {
         None => Cli::App(AppCommand::Run),
-        Some("new") => Cli::App(AppCommand::New(args.get(1).cloned())),
+        Some("new") => parse_new(&args[1..]),
         Some("show-all") => Cli::App(AppCommand::ShowAll),
         Some("hide-all") => Cli::App(AppCommand::HideAll),
         Some("toggle") => Cli::App(AppCommand::Toggle),
@@ -162,6 +172,31 @@ fn parse_cli(args: &[String]) -> Cli {
         Some("autostart") => parse_autostart_arg(args.get(1).map(String::as_str)),
         Some(_) => Cli::Help,
     }
+}
+
+/// PURE: `new [-c|--content <text> | --content=<text>] [<monitor>]`, options in any
+/// order.
+fn parse_new(args: &[String]) -> Cli {
+    let (mut monitor, mut content) = (None, None);
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        if let Some(text) = arg.strip_prefix("--content=") {
+            if content.is_some() {
+                return Cli::Help;
+            }
+            content = Some(text.to_string());
+            continue;
+        }
+        match arg.as_str() {
+            "-c" | "--content" => match rest.next() {
+                Some(text) if content.is_none() => content = Some(text.clone()),
+                _ => return Cli::Help,
+            },
+            _ if monitor.is_none() => monitor = Some(arg.clone()),
+            _ => return Cli::Help,
+        }
+    }
+    Cli::App(AppCommand::New { monitor, content })
 }
 
 fn parse_autostart_arg(arg: Option<&str>) -> Cli {
@@ -178,6 +213,19 @@ fn parse_autostart_arg(arg: Option<&str>) -> Cli {
 fn main() -> glib::ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match parse_cli(&args) {
+        Cli::App(AppCommand::New { monitor, content: Some(text) }) if text == "-" => {
+            let mut text = String::new();
+            if let Err(e) = std::io::Read::read_to_string(&mut std::io::stdin(), &mut text) {
+                eprintln!("waynote: could not read the note from stdin: {e}");
+                return glib::ExitCode::FAILURE;
+            }
+            // argv cannot carry a NUL: GApplication would cut the text there.
+            if text.contains('\0') {
+                eprintln!("waynote: the note text from stdin contains a NUL byte");
+                return glib::ExitCode::FAILURE;
+            }
+            run_app(AppCommand::New { monitor, content: Some(text) })
+        }
         Cli::App(cmd) => run_app(cmd),
         Cli::RenderDemo => run_render_demo(),
         Cli::Doctor => run_doctor(),
@@ -212,17 +260,19 @@ fn run_app(cmd: AppCommand) -> glib::ExitCode {
             .into_iter()
             .map(|s| s.to_string_lossy().into_owned())
             .collect();
-        // args[0] is the (synthetic) program name; args[1] is the verb, if any;
-        // args[2] (for `new`) is an optional monitor connector.
-        let monitor = args.get(2).filter(|m| !m.is_empty()).cloned();
-        let action: Option<(&str, Option<glib::Variant>)> = match args.get(1).map(String::as_str) {
-            Some("new") => Some(match monitor {
-                Some(m) => ("new-note-on", Some(m.to_variant())),
-                None => ("new-note", None),
-            }),
-            Some("show-all") => Some(("show-all", None)),
-            Some("hide-all") => Some(("hide-all", None)),
-            Some("toggle") => Some(("toggle", None)),
+        // args[0] is the (synthetic) program name; the rest is `AppCommand::argv`.
+        let action: Option<(&str, Option<glib::Variant>)> = match parse_cli(args.get(1..).unwrap_or_default()) {
+            Cli::App(AppCommand::New { monitor, content }) => {
+                let monitor = monitor.filter(|m| !m.is_empty());
+                Some(match (monitor, content) {
+                    (m, Some(text)) => ("new-note-with", Some((m.unwrap_or_default(), text).to_variant())),
+                    (Some(m), None) => ("new-note-on", Some(m.to_variant())),
+                    (None, None) => ("new-note", None),
+                })
+            }
+            Cli::App(AppCommand::ShowAll) => Some(("show-all", None)),
+            Cli::App(AppCommand::HideAll) => Some(("hide-all", None)),
+            Cli::App(AppCommand::Toggle) => Some(("toggle", None)),
             _ => None,
         };
         match action {
@@ -354,6 +404,7 @@ fn print_help() {
          USAGE:\n  \
            waynote                        run the app\n  \
            waynote new [<monitor>]        create a new note (optionally on a monitor, e.g. DP-2)\n  \
+           waynote new -c <text>          create a note with that text (`-c -` reads stdin)\n  \
            waynote show-all               show all notes\n  \
            waynote hide-all               hide all notes (pinned stay)\n  \
            waynote toggle                 hide all, or show all if any are hidden\n  \
@@ -514,28 +565,67 @@ mod tests {
 
     #[test]
     fn app_verbs_parse_to_commands() {
-        assert_eq!(parse_cli(&argv(&["new"])), Cli::App(AppCommand::New(None)));
+        assert_eq!(parse_cli(&argv(&["new"])), Cli::App(new(None, None)));
         assert_eq!(parse_cli(&argv(&["show-all"])), Cli::App(AppCommand::ShowAll));
         assert_eq!(parse_cli(&argv(&["hide-all"])), Cli::App(AppCommand::HideAll));
         assert_eq!(parse_cli(&argv(&["toggle"])), Cli::App(AppCommand::Toggle));
     }
 
+    fn new(monitor: Option<&str>, content: Option<&str>) -> AppCommand {
+        AppCommand::New { monitor: monitor.map(str::to_string), content: content.map(str::to_string) }
+    }
+
     #[test]
     fn new_verb_captures_optional_monitor() {
+        assert_eq!(parse_cli(&argv(&["new", "DP-2"])), Cli::App(new(Some("DP-2"), None)));
+    }
+
+    #[test]
+    fn new_verb_takes_the_note_text_before_or_after_the_monitor() {
+        assert_eq!(parse_cli(&argv(&["new", "-c", "hola"])), Cli::App(new(None, Some("hola"))));
         assert_eq!(
-            parse_cli(&argv(&["new", "DP-2"])),
-            Cli::App(AppCommand::New(Some("DP-2".to_string())))
+            parse_cli(&argv(&["new", "--content", "hola", "DP-2"])),
+            Cli::App(new(Some("DP-2"), Some("hola")))
         );
+        assert_eq!(
+            parse_cli(&argv(&["new", "DP-2", "-c", "-"])),
+            Cli::App(new(Some("DP-2"), Some("-")))
+        );
+        assert_eq!(
+            parse_cli(&argv(&["new", "--content=a=b", "DP-2"])),
+            Cli::App(new(Some("DP-2"), Some("a=b")))
+        );
+    }
+
+    #[test]
+    fn a_malformed_new_verb_is_help() {
+        assert_eq!(parse_cli(&argv(&["new", "-c"])), Cli::Help);
+        assert_eq!(parse_cli(&argv(&["new", "-c", "a", "-c", "b"])), Cli::Help);
+        assert_eq!(parse_cli(&argv(&["new", "--content=a", "-c", "b"])), Cli::Help);
+        assert_eq!(parse_cli(&argv(&["new", "DP-2", "HDMI-1"])), Cli::Help);
+    }
+
+    #[test]
+    fn the_forwarded_argv_parses_back_to_the_same_command() {
+        // The primary instance parses the argv `AppCommand::argv` builds.
+        for cmd in [
+            new(None, None),
+            new(Some("DP-2"), None),
+            new(None, Some("-c line\n")),
+            new(Some("DP-2"), Some("")),
+            new(Some("DP-2"), Some("--")),
+        ] {
+            assert_eq!(parse_cli(&cmd.argv()[1..]), Cli::App(cmd));
+        }
+        // GApplication drops a lone `--`; the text travels glued to its option.
+        assert!(!new(None, Some("--")).argv().iter().any(|a| a == "--"));
     }
 
     #[test]
     fn app_command_argv_includes_the_verb() {
         assert_eq!(AppCommand::Run.argv(), vec!["waynote"]);
-        assert_eq!(AppCommand::New(None).argv(), vec!["waynote", "new"]);
-        assert_eq!(
-            AppCommand::New(Some("DP-2".to_string())).argv(),
-            vec!["waynote", "new", "DP-2"]
-        );
+        assert_eq!(new(None, None).argv(), vec!["waynote", "new"]);
+        assert_eq!(new(Some("DP-2"), None).argv(), vec!["waynote", "new", "DP-2"]);
         assert_eq!(AppCommand::Toggle.argv(), vec!["waynote", "toggle"]);
     }
 

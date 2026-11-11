@@ -144,6 +144,7 @@ seconds.
 ```sh
 waynote                             # run the app
 waynote new [<monitor>]             # create a new note (optionally on a monitor, e.g. DP-2)
+waynote new -c <text> [<monitor>]   # create a note with that text (`-c -` reads stdin)
 waynote show-all | hide-all | toggle  # show / hide all notes (forwards to the app)
 waynote doctor                      # run diagnostics (D-Bus, SNI tray, paths)
 waynote install-user-assets         # install icon, .desktop, and systemd unit

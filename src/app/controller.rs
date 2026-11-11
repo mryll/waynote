@@ -2316,15 +2316,23 @@ impl Controller {
     /// 6. Builds the NoteChrome + event handler and presents via the presenter.
     ///
     /// `explicit_output`: if `Some`, override monitor resolution to the named connector.
-    pub fn create_note(this: &Rc<RefCell<Self>>, explicit_output: Option<&str>) {
+    /// `body`: if `Some`, the note starts with that text and is shown, not opened for
+    /// editing: it comes from a script (`waynote new -c`), which must not take the
+    /// keyboard.
+    pub fn create_note(this: &Rc<RefCell<Self>>, explicit_output: Option<&str>, body: Option<&str>) {
         use crate::app::monitor_resolve::active_monitor;
         use crate::platform::store;
 
+        // Empty text is a plain new note, opened for editing.
+        let body = body.filter(|b| !b.is_empty());
         let (id, note, path, monitor_idx, entry_count, default_size) = {
             let mut c = this.borrow_mut();
             let id = c.idgen.new_id();
             let default_layer = parse_layer_str(&c.config.default_layer);
-            let note = new_note(id.clone(), &c.config.default_color.clone(), &default_layer);
+            let mut note = new_note(id.clone(), &c.config.default_color.clone(), &default_layer);
+            if let Some(body) = body {
+                note.body = body.to_string();
+            }
             let cursor = cursor_monitor_index(&c.monitors);
             let monitor_idx = active_monitor(
                 explicit_output,
@@ -2408,6 +2416,9 @@ impl Controller {
         install_event_handler_for(this, &id);
         presenter::sync_surface(&mut this.borrow_mut(), surf_idx);
         Self::refresh_tray_note_state(this);
+        if body.is_some() {
+            return;
+        }
 
         // New-note UX: drop straight into edit mode + focus. Deferred to idle so
         // the surface is synced/realized first; routed through `on_edit_requested`
